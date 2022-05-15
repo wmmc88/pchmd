@@ -1,5 +1,11 @@
 @0xd18ac87e227503c0;
 
+struct Version {
+    major @0 :UInt8;
+    minor @1 :UInt8;
+    patch @2 :UInt8;
+}
+
 struct SensorValue {
 	union {
 		signedIntegerValue @0 :UInt64;
@@ -18,6 +24,7 @@ struct SensorData {
 struct PCInfo {
 	name @0 :Text; # human readable name for convenience
 	uuid @1 :UInt16;
-	sensors @2 :List(SensorData);
+	serverVersion @2 :Version;
+	sensors @3 :List(SensorData);
 }
 
