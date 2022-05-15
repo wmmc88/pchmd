@@ -1,9 +1,13 @@
 @0xd18ac87e227503c0;
 
+const majorVersion :UInt8 = 0;
+const minorVersion :UInt8 = 1;
+const patchVersion :UInt8 = 0;
+
 struct Version {
-    major @0 :UInt8;
-    minor @1 :UInt8;
-    patch @2 :UInt8;
+    major @0 :UInt8 = .majorVersion;
+    minor @1 :UInt8 = .minorVersion;
+    patch @2 :UInt8 = .patchVersion;
 }
 
 struct SensorValue {
