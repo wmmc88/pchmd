@@ -4,7 +4,7 @@ A Cross-Platform GUI and back-end designed to display PC sensor data(ex. Temps, 
 ## Tentative Planned Features
 
 - [ ] LibreHardwareMonitor as a data source for server backend(Windows, Linux)
-- [ ] lm-sensors as a data source for server backend(Linux)
+- [ ] libsensors (lm-sensors library) as a data source for server backend(Linux)
 - [ ] nvml or XNVCtrl as a data source for server backend(Linux)
 - [ ] support multiple client gui connections per server backend
 - [ ] local client gui running on PC
