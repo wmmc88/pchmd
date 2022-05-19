@@ -14,7 +14,6 @@ fn main() {
     generate_librehardwaremonitor_bindings();
 }
 
-
 fn generate_capnproto_files() {
     println!("cargo:rerun-if-changed=schema/pchmd.capnp");
 
@@ -41,11 +40,14 @@ fn generate_libsensors_bindings() {
 
     let bindings = bindgen::Builder::default()
         .header("src/libsensors-wrapper.h")
+        .clang_args([
+            "-fretain-comments-from-system-headers",
+            "-fparse-all-comments",
+        ])
         .parse_callbacks(Box::new(bindgen::CargoCallbacks))
         .generate()
         .expect("Unable to generate rust bindings for libsensors");
 
-    // Write the bindings to the $OUT_DIR/bindings.rs file.
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     bindings
         .write_to_file(out_path.join("libsensors-bindings.rs"))
