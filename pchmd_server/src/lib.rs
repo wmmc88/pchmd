@@ -58,8 +58,7 @@ impl<'a> DataSource for LibsensorsDataSource<'a> {
             while !sensors_chip_name.is_null() {
                 // TODO: break out into get chip name fn
                 const MAX_NAME_LENGTH: usize = 200;
-                let mut chip_name: MaybeUninit<[std::os::raw::c_char; MAX_NAME_LENGTH]> =
-                    MaybeUninit::uninit();
+                let mut chip_name = MaybeUninit::<[std::os::raw::c_char; MAX_NAME_LENGTH]>::uninit();
                 if libsensors::sensors_snprintf_chip_name(
                     chip_name.as_mut_ptr() as *mut std::os::raw::c_char,
                     MAX_NAME_LENGTH as u64,
@@ -71,8 +70,8 @@ impl<'a> DataSource for LibsensorsDataSource<'a> {
                     let chip_name = std::ffi::CStr::from_ptr(
                         chip_name.assume_init().as_mut_ptr() as *mut std::os::raw::c_char
                     )
-                    .to_str()
-                    .expect("Invalid C string encoding encountered while converting chip name!");
+                        .to_str()
+                        .expect("Invalid C string encoding encountered while converting chip name!");
                     println!("{chip_name}");
                 }
 
@@ -87,8 +86,76 @@ impl<'a> DataSource for LibsensorsDataSource<'a> {
                 };
                 println!("Adapter: {adapter_name}");
 
-                // TODO: parse chip data (reimplement print chip logic)
-                todo!("parse chip data (reimplement print chip logic)");
+                // TODO: break out into print chip function
+                let mut feature_number = 0;
+                let mut sensors_feature =
+                    libsensors::sensors_get_features(sensors_chip_name, &mut feature_number);
+                while !sensors_feature.is_null() {
+                    match (*sensors_feature).type_ {
+                        libsensors::sensors_feature_type_SENSORS_FEATURE_IN => {
+                            let label = libsensors::sensors_get_label(sensors_chip_name, sensors_feature);
+                            if label.is_null() {
+                                let name_str = std::ffi::CStr::from_ptr((*sensors_feature).name).to_str().expect("Invalid C string encoding encountered while converting feature name!");
+                                panic!("ERROR: Can't get label of feature {}", name_str);
+                            }
+                            let label_str = std::ffi::CStr::from_ptr(label).to_str().expect("Invalid C string encoding encountered while converting label name!");
+                            println!("label: {label_str}");
+                            libc::free(label as *mut std::ffi::c_void);
+
+                            let sensors_subfeature = libsensors::sensors_get_subfeature(sensors_chip_name, sensors_feature, libsensors::sensors_subfeature_type_SENSORS_SUBFEATURE_IN_INPUT);
+                            if !sensors_subfeature.is_null() {
+                                if let Ok(value) = get_sensor_value(sensors_chip_name, sensors_subfeature) {
+                                    println!("{value}");
+                                } else {
+                                    println!("     N/A  ")
+                                }
+                            } else {
+                                println!("     N/A  ");
+                            }
+                        }
+
+                        libsensors::sensors_feature_type_SENSORS_FEATURE_FAN => {
+                            // print_chip_fan(name, feature, label_size)
+                        }
+
+                        libsensors::sensors_feature_type_SENSORS_FEATURE_TEMP => {
+                            // print_chip_temp(name, feature, label_size)
+                        }
+
+                        libsensors::sensors_feature_type_SENSORS_FEATURE_POWER => {
+                            // print_chip_power(name, feature, label_size)
+                        }
+                        libsensors::sensors_feature_type_SENSORS_FEATURE_ENERGY => {
+                            // print_chip_energy(name, feature, label_size)
+                        }
+
+                        libsensors::sensors_feature_type_SENSORS_FEATURE_CURR => {
+                            // print_chip_curr(name, feature, label_size)
+                        }
+                        libsensors::sensors_feature_type_SENSORS_FEATURE_HUMIDITY => {
+                            // print_chip_humidity(name, feature, label_size)
+                        }
+                        libsensors::sensors_feature_type_SENSORS_FEATURE_VID => {
+                            // print_chip_vid(name, feature, label_size)
+                        }
+
+                        libsensors::sensors_feature_type_SENSORS_FEATURE_INTRUSION => {
+                            // print_chip_intrusion(name, feature, label_size)
+                        }
+
+                        libsensors::sensors_feature_type_SENSORS_FEATURE_BEEP_ENABLE => {
+                            // print_chip_beep_enable(name, feature, label_size)
+                        }
+
+                        invalid_value @ (libsensors::sensors_feature_type_SENSORS_FEATURE_MAX_MAIN | libsensors::sensors_feature_type_SENSORS_FEATURE_MAX_OTHER | libsensors::sensors_feature_type_SENSORS_FEATURE_UNKNOWN) => {
+                            panic!("{invalid_value} is an invalid sensors_feature_type value!");
+                        }
+
+                        unknown_value @ _ => {
+                            panic!("{unknown_value} is an unsupported sensors_feature_type value!");
+                        }
+                    }
+                }
 
                 chip_number += 1;
                 sensors_chip_name =
@@ -109,6 +176,26 @@ impl<'a> Drop for LibsensorsDataSource<'a> {
 impl<'a> LibsensorsDataSource<'a> {
     pub fn get_version(&self) -> &Option<&str> {
         &self.version
+    }
+}
+
+// TODO: put this in a better place!
+fn get_sensor_value(sensors_chip_name: *const libsensors::sensors_chip_name, subfeature: *const libsensors::sensors_subfeature) -> Result<f64, String> {
+    let mut val = MaybeUninit::<f64>::uninit();
+    let errno = unsafe { libsensors::sensors_get_value(sensors_chip_name, (*subfeature).number, val.as_mut_ptr()) };
+    if errno != 0 && errno != -(libsensors::SENSORS_ERR_ACCESS_R as i32) {
+        let subfeature_name = unsafe { std::ffi::CStr::from_ptr((*subfeature).name) }.to_str().expect("Invalid C string encoding encountered while converting lib_sensors strerror output!");
+
+        let error_string = unsafe {libsensors::sensors_strerror(errno)};
+        let error_string = if error_string.is_null() {
+            "Unknown Error (libsensors failed to translate errno to readable error)"
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(error_string) }.to_str().expect("Invalid C string encoding encountered while converting lib_sensors strerror output!")
+        };
+
+        Err(format!("ERROR: Can't get value of subfeature {}: {}", subfeature_name, error_string))
+    } else {
+        Ok(unsafe { val.assume_init() })
     }
 }
 
