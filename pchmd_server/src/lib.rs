@@ -2,7 +2,9 @@ pub mod pchmd_capnp {
     include!(concat!(env!("OUT_DIR"), "/pchmd_capnp.rs"));
 }
 
-pub trait DataSource {
+pub trait DataSource<'a> {
+    const NAME: &'a str;
+
     fn new() -> Self;
     fn init(&mut self);
     fn get_version(&self) -> Option<&str>;
@@ -14,7 +16,9 @@ pub struct LibsensorsDataSource {
     version: Option<String>,
 }
 
-impl DataSource for LibsensorsDataSource {
+impl<'a> DataSource<'a> for LibsensorsDataSource {
+    const NAME: &'a str = "libsensors (lm-sensors library)";
+
     fn new() -> Self {
         LibsensorsDataSource::default()
     }
