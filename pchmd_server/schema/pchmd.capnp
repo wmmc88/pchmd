@@ -25,10 +25,9 @@ struct SensorData {
 	average @3 :SensorValue;
 }
 
-struct PCInfo {
+struct ComputerInfo {
 	name @0 :Text; # human readable name for convenience
 	uuid @1 :UInt16;
 	serverVersion @2 :Version;
 	sensors @3 :List(SensorData);
 }
-

@@ -30,11 +30,15 @@ impl<'a> DataSource<'a> for LibsensorsDataSource {
         }
 
         self.lm_sensors_handle = Some(Box::new(lm_sensors_handle.unwrap()));
-        self.version = Some(self.lm_sensors_handle.as_ref().unwrap().version().unwrap().to_string());
+        self.version = self
+            .lm_sensors_handle
+            .as_ref()
+            .unwrap()
+            .version()
+            .map(str::to_string);
     }
 
     fn get_version(&self) -> Option<&str> {
         self.version.as_deref()
     }
 }
-

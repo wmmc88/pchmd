@@ -8,5 +8,5 @@ fn main() {
         data_source.get_version().unwrap_or("Unknown")
     );
 
-    println!("SERVER FINISHED EXECUTING?");
+    println!("SERVER FINISHED EXECUTING!!");
 }
