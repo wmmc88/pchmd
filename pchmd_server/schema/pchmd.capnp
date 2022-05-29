@@ -12,22 +12,42 @@ struct Version {
 
 struct SensorValue {
 	union {
-		signedIntegerValue @0 :UInt64;
-		unsignedIntegerValue @1 :Int64;
-		floatValue @2 :Float64;
+		floatValue @0 :Float64;
+		boolValue @1 :Bool;
+		stringValue @2 :Text;
 	}
 }
 
 struct SensorData {
-	current @0 :SensorValue;
-	min @1 :SensorValue;
-	max @2 :SensorValue;
-	average @3 :SensorValue;
+    sensorName @0: Text;
+    dataSourceName @1: Text;
+
+	current @2 :SensorValue;
+    average @3 :SensorValue;
+	minimum @4 :SensorValue;
+	maximum @5 :SensorValue;
+
+    measurementUnit @6 :MeasurementUnit;
+    enum MeasurementUnit {
+        none @0;
+        volt @1;
+        amp @2;
+        watt @3;
+        joule @4;
+        celcius @5;
+        second @6;
+        rotationPerMinute @7;
+        percentage @8;
+    }
+
+	isStale @7 :Bool;
 }
 
 struct ComputerInfo {
 	name @0 :Text; # human readable name for convenience
-	uuid @1 :UInt16;
-	serverVersion @2 :Version;
-	sensors @3 :List(SensorData);
+	uuidUpper @1 :UInt64; # upper 64 bits: typically UUID seeded from mac address
+	uuidLower @2 :UInt64; # lower 64 bits: typically UUID seeded from mac address
+    operatingSystem @3 :Text;
+	serverVersion @4 :Version;
+	sensors @5 :List(SensorData);
 }

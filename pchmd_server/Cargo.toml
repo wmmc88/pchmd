@@ -6,7 +6,19 @@ edition = "2021"
 
 [dependencies]
 capnp = "0.14.6"
+chrono = "0.4.19"
+crossterm = "0.23.2"
+hostname = "0.3.1"
 lm-sensors = "0.1.4"
+mac_address = "1.1.3"
+quinn = "0.8.3"
+rand = "0.8.5"
+rand_pcg = "0.3.1"
+rand_seeder = "0.2.3"
+tabled = "0.7.0"
+uuid = "1.0.0"
+quinn = "*"
+rustls = { version = "*", features = ["dangerous_configuration", "quic"] } # TODO: remove dangerous_configuration
 
 [build-dependencies]
 capnpc = "0.14.7"
