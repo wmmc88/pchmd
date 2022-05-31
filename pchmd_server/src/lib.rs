@@ -6,15 +6,22 @@
 extern crate core;
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use capnp::serialize_packed;
+use futures_util::StreamExt;
 use lm_sensors::prelude::*;
 use lm_sensors::value::Unit;
 use lm_sensors::Value;
+use quinn::Endpoint;
 use rand::prelude::*;
 use rand_pcg::Pcg64Mcg;
 use rand_seeder::Seeder;
+use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
 
 pub mod pchmd_capnp {
     include!(concat!(env!("OUT_DIR"), "/pchmd_capnp.rs"));
@@ -39,7 +46,10 @@ pub struct Server {
 
 impl Server {
     #[must_use]
-    pub fn new(data_sources: Vec<DataSource>, transport_interfaces: Vec<TransportInterface>) -> Self {
+    pub fn new(
+        data_sources: Vec<DataSource>,
+        transport_interfaces: Vec<TransportInterface>,
+    ) -> Self {
         Self {
             data_sources,
             transport_interfaces,
@@ -70,16 +80,19 @@ impl Server {
     }
 
     fn run_once(&mut self) {
+        // TODO: evaluate running each data source in parallel (queues to a thread that manages the data?)
         for data_source in &self.data_sources {
             data_source.update_values(&mut self.sensor_data, &self.ewma_alpha_value);
         }
-        let mut serialized_msg = self.serialize_to_capnproto();
+
+        let serialized_msg = self.serialize_to_capnproto();
+
         for interface in &self.transport_interfaces {
-            interface.send_message(&serialized_msg);
+            interface.send_message(serialized_msg.clone());
         }
     }
 
-    fn serialize_to_capnproto(&self) -> Vec<u8> {
+    fn serialize_to_capnproto(&self) -> Arc<Vec<u8>> {
         let mut message = capnp::message::Builder::new_default();
         {
             let mut computer_info = message.init_root::<pchmd_capnp::computer_info::Builder>();
@@ -222,7 +235,7 @@ impl Server {
         }
         let mut buffer = Vec::new();
         serialize_packed::write_message(&mut buffer, &message).unwrap();
-        buffer
+        Arc::new(buffer)
     }
 }
 
@@ -327,7 +340,7 @@ impl<'a> LibsensorsDataSource {
         self.version.as_deref()
     }
 
-    fn update_values(&self, sensor_data_map: &mut SensorDataMap, EWMA_ALPHA_VALUE: &f64) {
+    fn update_values(&self, sensor_data_map: &mut SensorDataMap, ewma_alpha_value: &f64) {
         for chip in self.lm_sensors_handle.as_ref().unwrap().chip_iter(None) {
             let sensor_location = chip.path().map_or_else(
                 || format!("{} at ({})", chip, chip.bus()),
@@ -362,18 +375,18 @@ impl<'a> LibsensorsDataSource {
                                         SensorValue::Float(average_value) => {
                                             if let SensorValue::Float(current_value) = sensor_value
                                             {
-                                                let average_value = *EWMA_ALPHA_VALUE
+                                                let average_value = *ewma_alpha_value
                                                     * current_value
-                                                    + (1.0 - *EWMA_ALPHA_VALUE) * average_value;
+                                                    + (1.0 - *ewma_alpha_value) * average_value;
                                                 sensor_data.average_value =
                                                     SensorValue::Float(average_value);
                                             }
                                         }
                                         SensorValue::Bool(average_value) => {
                                             if let SensorValue::Bool(current_value) = sensor_value {
-                                                let average_value = *EWMA_ALPHA_VALUE
+                                                let average_value = *ewma_alpha_value
                                                     * current_value
-                                                    + (1.0 - *EWMA_ALPHA_VALUE) * average_value;
+                                                    + (1.0 - *ewma_alpha_value) * average_value;
                                                 sensor_data.average_value =
                                                     SensorValue::Float(average_value);
                                             }
@@ -590,7 +603,7 @@ pub enum TransportInterface {
 }
 
 impl TransportInterface {
-    fn send_message(&self, serialized_message: &Vec<u8>) {
+    fn send_message(&self, serialized_message: Arc<Vec<u8>>) {
         match self {
             TransportInterface::QUIC(transport_interface) => {
                 transport_interface.send_message(serialized_message);
@@ -599,15 +612,123 @@ impl TransportInterface {
     }
 }
 
-#[derive(Default, Debug)]
-pub struct QUICTransportInterface {}
+#[derive(Debug)]
+pub struct QUICTransportInterface {
+    serialized_sensor_data_sender: broadcast::Sender<Arc<Vec<u8>>>,
+    quic_server_task_handle: tokio::task::JoinHandle<()>,
+}
 
-impl QUICTransportInterface {
-    fn send_message(&self, serialized_message: &Vec<u8>) {
-        todo!();
+impl<'a> QUICTransportInterface {
+    const CERT_PEM: &'a str = "-----BEGIN CERTIFICATE-----
+    MIIBUjCB+aADAgECAgkAz1vuzG6opxQwCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwW
+    cmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEw
+    MTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMG
+    ByqGSM49AgEGCCqGSM49AwEHA0IABJHCy1MLoykAXS8sD1jXBDfpNeVzZAGJJ8Fv
+    Tu/7OrYj4kEomKbl0qn4uYK/wmEgPwjDoCe+2vg8FJTDT28txGSjGDAWMBQGA1Ud
+    EQQNMAuCCWxvY2FsaG9zdDAKBggqhkjOPQQDAgNIADBFAiBUOY7QT2ZUocjbt35I
+    f9C3ificV0wk6hvrp6sY4UQUTgIhAJFLMmmBC3o9NOJNaWpdTuUKFIzQZFl61gFu
+    MWcWnCgP
+    -----END CERTIFICATE-----";
+
+    const CERT_PRIVATE_KEY: &'a str = "-----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgDdLdN7LoG7QQ5yk4
+    ufdOECGHysL92BBCRPN9xoV/qTmhRANCAASRwstTC6MpAF0vLA9Y1wQ36TXlc2QB
+    iSfBb07v+zq2I+JBKJim5dKp+LmCv8JhID8Iw6Anvtr4PBSUw09vLcRk
+    -----END PRIVATE KEY-----";
+
+    pub fn new() -> Self {
+        let (serialized_sensor_data_sender, _serialized_sensor_data_receiver) =
+            broadcast::channel((2.0 / DEFAULT_UPDATE_PERIOD_SECONDS).ceil() as usize); // todo: configurable capacity?
+
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let quic_server_task_handle = tokio_runtime.spawn(Self::quic_server_task(
+            serialized_sensor_data_sender.clone(),
+        ));
+        // TODO: graceful shutdown of quic_server_task_handle
+
+        Self {
+            serialized_sensor_data_sender,
+            quic_server_task_handle,
+        }
+    }
+
+    async fn quic_server_task(sender: broadcast::Sender<Arc<Vec<u8>>>) {
+        let server_addr = "127.0.0.1:5000".parse().unwrap(); // TODO: configurable
+        let mut incoming = Self::make_server_endpoint(server_addr).unwrap();
+
+        while let Some(conn) = incoming.next().await {
+            let new_connection = conn.await.unwrap();
+            println!(
+                "[server] connection accepted: addr={}",
+                new_connection.connection.remote_address()
+            );
+            let send = new_connection.connection.open_uni().await.unwrap();
+            tokio::spawn(Self::quic_conection_task(send, sender.subscribe()));
+        }
+        // TODO: graceful shutdown of connection tasks
+    }
+
+    async fn quic_conection_task(
+        mut send: quinn::SendStream,
+        mut receiver: broadcast::Receiver<Arc<Vec<u8>>>,
+    ) {
+        loop {
+            match receiver.recv().await {
+                Ok(serialized_message) => {
+                    send.write_all(serialized_message.as_slice()).await.unwrap();
+                }
+                Err(RecvError::Closed) => break,
+                Err(RecvError::Lagged(_)) => {
+                    eprintln!("Lagged!!!!!!!") // TODO: better error message
+                }
+            }
+        }
+        send.finish().await.unwrap()
+    }
+
+    fn make_server_endpoint(bind_addr: SocketAddr) -> Result<quinn::Incoming, Box<dyn Error>> {
+        let cert_der = match rustls_pemfile::read_one(&mut Self::CERT_PEM.as_bytes())
+            .unwrap()
+            .unwrap()
+        {
+            rustls_pemfile::Item::X509Certificate(cert_der) => cert_der,
+            _ => {
+                unreachable!()
+            }
+        };
+        let cert_chain = vec![rustls::Certificate(cert_der)];
+
+        let private_key_der = match rustls_pemfile::read_one(&mut Self::CERT_PRIVATE_KEY.as_bytes())
+            .unwrap()
+            .unwrap()
+        {
+            rustls_pemfile::Item::PKCS8Key(private_key_der) => private_key_der,
+
+            _ => {
+                unreachable!()
+            }
+        };
+        let private_key = rustls::PrivateKey(private_key_der);
+
+        let server_config = quinn::ServerConfig::with_single_cert(cert_chain, private_key)?;
+        let (_endpoint, incoming) = Endpoint::server(server_config, bind_addr)?;
+        Ok(incoming)
+    }
+
+    fn send_message(&self, serialized_message: Arc<Vec<u8>>) {
+        match self.serialized_sensor_data_sender.send(serialized_message) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("No QUICTransportInterface clients to send data to.");
+            }
+        }
     }
 }
 
+/// client code
 pub struct CLIClient {}
 
 impl CLIClient {
@@ -659,87 +780,87 @@ impl CLIClient {
     // println!("Done!");
 }
 
-    // fn print_serialized_message(serialized_message: &mut Vec<u8>) {
-    //     let message_reader = serialize_packed::read_message(
-    //         &mut serialized_message.as_slice(),
-    //         ::capnp::message::ReaderOptions::default(),
-    //     ).unwrap();
-    //     let computer_info = message_reader.get_root::<pchmd_capnp::computer_info::Reader>().unwrap();
-    //
-    //     println!("Name: {}", computer_info.get_name().unwrap());
-    //     let (upper, lower) = (
-    //         computer_info.get_uuid_upper(),
-    //         computer_info.get_uuid_lower(),
-    //     );
-    //     println!("UUID: {}", uuid::Uuid::from_u64_pair(upper, lower).hyphenated());
-    //     println!(
-    //         "Operating System: {}",
-    //         computer_info.get_operating_system().unwrap()
-    //     );
-    //     let version = computer_info.get_server_version().unwrap();
-    //     println!(
-    //         "Server Version: {}.{}.{}",
-    //         version.get_major(),
-    //         version.get_minor(),
-    //         version.get_patch()
-    //     );
-    //     for sensor in computer_info.get_sensors().unwrap().iter() {
-    //         println!(
-    //             "{} from {}",
-    //             sensor.get_sensor_name().unwrap(),
-    //             sensor.get_data_source_name().unwrap()
-    //         );
-    //         print!("current: ");
-    //         match sensor.get_current().unwrap().which().unwrap() {
-    //             pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
-    //                 print!("{value}");
-    //             }
-    //             pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
-    //                 print!("{value}");
-    //             }
-    //             pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
-    //                 print!("{}", value.unwrap());
-    //             }
-    //         };
-    //
-    //         print!(", average: ");
-    //         match sensor.get_average().unwrap().which().unwrap() {
-    //             pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
-    //                 print!("{value}");
-    //             }
-    //             pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
-    //                 print!("{value}");
-    //             }
-    //             pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
-    //                 print!("{}", value.unwrap());
-    //             }
-    //         };
-    //
-    //         print!(", minimum: ");
-    //         match sensor.get_minimum().unwrap().which().unwrap() {
-    //             pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
-    //                 print!("{value}");
-    //             }
-    //             pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
-    //                 print!("{value}");
-    //             }
-    //             pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
-    //                 print!("{}", value.unwrap());
-    //             }
-    //         };
-    //
-    //         print!(", maximum: ");
-    //         match sensor.get_maximum().unwrap().which().unwrap() {
-    //             pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
-    //                 print!("{value}");
-    //             }
-    //             pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
-    //                 print!("{value}");
-    //             }
-    //             pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
-    //                 print!("{}", value.unwrap());
-    //             }
-    //         };
-    //     }
-    // }
-}
+// fn print_serialized_message(serialized_message: &mut Vec<u8>) {
+//     let message_reader = serialize_packed::read_message(
+//         &mut serialized_message.as_slice(),
+//         ::capnp::message::ReaderOptions::default(),
+//     ).unwrap();
+//     let computer_info = message_reader.get_root::<pchmd_capnp::computer_info::Reader>().unwrap();
+//
+//     println!("Name: {}", computer_info.get_name().unwrap());
+//     let (upper, lower) = (
+//         computer_info.get_uuid_upper(),
+//         computer_info.get_uuid_lower(),
+//     );
+//     println!("UUID: {}", uuid::Uuid::from_u64_pair(upper, lower).hyphenated());
+//     println!(
+//         "Operating System: {}",
+//         computer_info.get_operating_system().unwrap()
+//     );
+//     let version = computer_info.get_server_version().unwrap();
+//     println!(
+//         "Server Version: {}.{}.{}",
+//         version.get_major(),
+//         version.get_minor(),
+//         version.get_patch()
+//     );
+//     for sensor in computer_info.get_sensors().unwrap().iter() {
+//         println!(
+//             "{} from {}",
+//             sensor.get_sensor_name().unwrap(),
+//             sensor.get_data_source_name().unwrap()
+//         );
+//         print!("current: ");
+//         match sensor.get_current().unwrap().which().unwrap() {
+//             pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
+//                 print!("{value}");
+//             }
+//             pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
+//                 print!("{value}");
+//             }
+//             pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
+//                 print!("{}", value.unwrap());
+//             }
+//         };
+//
+//         print!(", average: ");
+//         match sensor.get_average().unwrap().which().unwrap() {
+//             pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
+//                 print!("{value}");
+//             }
+//             pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
+//                 print!("{value}");
+//             }
+//             pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
+//                 print!("{}", value.unwrap());
+//             }
+//         };
+//
+//         print!(", minimum: ");
+//         match sensor.get_minimum().unwrap().which().unwrap() {
+//             pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
+//                 print!("{value}");
+//             }
+//             pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
+//                 print!("{value}");
+//             }
+//             pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
+//                 print!("{}", value.unwrap());
+//             }
+//         };
+//
+//         print!(", maximum: ");
+//         match sensor.get_maximum().unwrap().which().unwrap() {
+//             pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
+//                 print!("{value}");
+//             }
+//             pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
+//                 print!("{value}");
+//             }
+//             pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
+//                 print!("{}", value.unwrap());
+//             }
+//         };
+//     }
+// }
+// }
