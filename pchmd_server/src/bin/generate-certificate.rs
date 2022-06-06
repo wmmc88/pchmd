@@ -1,5 +1,3 @@
-use rcgen;
-
 fn main() {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let pem = cert.serialize_pem().unwrap();

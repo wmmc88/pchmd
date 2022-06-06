@@ -6,24 +6,30 @@
 extern crate core;
 
 use std::collections::HashMap;
-use std::error::Error;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::fmt;
+use std::io::{stdout, Write};
 use std::time::{Duration, Instant};
+use std::{error::Error, net::SocketAddr, sync::Arc};
 
-use capnp::serialize_packed;
+use capnp::serialize;
+use crossterm::{ExecutableCommand, QueueableCommand};
 use futures_util::StreamExt;
 use lm_sensors::prelude::*;
 use lm_sensors::value::Unit;
 use lm_sensors::Value;
-use quinn::Endpoint;
+use quinn::{Endpoint, IncomingUniStreams};
 use rand::prelude::*;
 use rand_pcg::Pcg64Mcg;
 use rand_seeder::Seeder;
+use tabled::Tabled;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
 pub mod pchmd_capnp {
+    #![allow(clippy::all)]
+    #![allow(clippy::pedantic)]
+    #![allow(clippy::nursery)]
+    #![allow(clippy::cargo)]
     include!(concat!(env!("OUT_DIR"), "/pchmd_capnp.rs"));
 }
 
@@ -82,7 +88,7 @@ impl Server {
     fn run_once(&mut self) {
         // TODO: evaluate running each data source in parallel (queues to a thread that manages the data?)
         for data_source in &self.data_sources {
-            data_source.update_values(&mut self.sensor_data, &self.ewma_alpha_value);
+            data_source.update_values(&mut self.sensor_data, self.ewma_alpha_value);
         }
 
         let serialized_msg = self.serialize_to_capnproto();
@@ -124,11 +130,14 @@ impl Server {
                         SensorValue::Float(value) => {
                             current.set_float_value(*value);
                         }
-                        SensorValue::Bool(value) => {
+                        SensorValue::RawBool(value) => {
                             current.set_bool_value(value.round() as u8 != 0);
                         }
                         SensorValue::Text(value) => {
                             current.set_string_value(value.as_str());
+                        }
+                        SensorValue::Bool(_) => {
+                            unreachable!();
                         }
                     }
                 }
@@ -138,11 +147,14 @@ impl Server {
                         SensorValue::Float(value) => {
                             average.set_float_value(*value);
                         }
-                        SensorValue::Bool(value) => {
+                        SensorValue::RawBool(value) => {
                             average.set_bool_value(value.round() as u8 != 0);
                         }
                         SensorValue::Text(value) => {
                             average.set_string_value(value.as_str());
+                        }
+                        SensorValue::Bool(_) => {
+                            unreachable!();
                         }
                     }
                 }
@@ -152,11 +164,14 @@ impl Server {
                         SensorValue::Float(value) => {
                             minimum.set_float_value(*value);
                         }
-                        SensorValue::Bool(value) => {
+                        SensorValue::RawBool(value) => {
                             minimum.set_bool_value(value.round() as u8 != 0);
                         }
                         SensorValue::Text(value) => {
                             minimum.set_string_value(value.as_str());
+                        }
+                        SensorValue::Bool(_) => {
+                            unreachable!();
                         }
                     }
                 }
@@ -166,11 +181,14 @@ impl Server {
                         SensorValue::Float(value) => {
                             maximum.set_float_value(*value);
                         }
-                        SensorValue::Bool(value) => {
+                        SensorValue::RawBool(value) => {
                             maximum.set_bool_value(value.round() as u8 != 0);
                         }
                         SensorValue::Text(value) => {
                             maximum.set_string_value(value.as_str());
+                        }
+                        SensorValue::Bool(_) => {
+                            unreachable!();
                         }
                     }
                 }
@@ -234,7 +252,7 @@ impl Server {
             }
         }
         let mut buffer = Vec::new();
-        serialize_packed::write_message(&mut buffer, &message).unwrap();
+        serialize::write_message(&mut buffer, &message).unwrap();
         Arc::new(buffer)
     }
 }
@@ -257,7 +275,7 @@ impl DataSource {
         }
     }
 
-    fn update_values(&self, sensor_data_map: &mut SensorDataMap, ewma_alpha_value: &f64) {
+    fn update_values(&self, sensor_data_map: &mut SensorDataMap, ewma_alpha_value: f64) {
         match self {
             DataSource::Libsensors(data_source) => {
                 data_source.update_values(sensor_data_map, ewma_alpha_value);
@@ -289,8 +307,16 @@ struct SensorData {
 #[derive(Debug, Clone)]
 enum SensorValue {
     Float(f64),
-    Bool(f64), // f64 as type to be able to min/max/average subsequent values
+    Bool(bool),
     Text(String),
+
+    RawBool(f64), // f64 as type to be able to min/max/average subsequent values
+}
+
+impl fmt::Display for SensorValue {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self)
+    }
 }
 
 #[derive(Debug)]
@@ -340,7 +366,7 @@ impl<'a> LibsensorsDataSource {
         self.version.as_deref()
     }
 
-    fn update_values(&self, sensor_data_map: &mut SensorDataMap, ewma_alpha_value: &f64) {
+    fn update_values(&self, sensor_data_map: &mut SensorDataMap, ewma_alpha_value: f64) {
         for chip in self.lm_sensors_handle.as_ref().unwrap().chip_iter(None) {
             let sensor_location = chip.path().map_or_else(
                 || format!("{} at ({})", chip, chip.bus()),
@@ -375,24 +401,29 @@ impl<'a> LibsensorsDataSource {
                                         SensorValue::Float(average_value) => {
                                             if let SensorValue::Float(current_value) = sensor_value
                                             {
-                                                let average_value = *ewma_alpha_value
+                                                let average_value = ewma_alpha_value
                                                     * current_value
-                                                    + (1.0 - *ewma_alpha_value) * average_value;
+                                                    + (1.0 - ewma_alpha_value) * average_value;
                                                 sensor_data.average_value =
                                                     SensorValue::Float(average_value);
                                             }
                                         }
-                                        SensorValue::Bool(average_value) => {
-                                            if let SensorValue::Bool(current_value) = sensor_value {
-                                                let average_value = *ewma_alpha_value
+                                        SensorValue::RawBool(average_value) => {
+                                            if let SensorValue::RawBool(current_value) =
+                                                sensor_value
+                                            {
+                                                let average_value = ewma_alpha_value
                                                     * current_value
-                                                    + (1.0 - *ewma_alpha_value) * average_value;
+                                                    + (1.0 - ewma_alpha_value) * average_value;
                                                 sensor_data.average_value =
                                                     SensorValue::Float(average_value);
                                             }
                                         }
-                                        SensorValue::Text(average_value) => {
+                                        SensorValue::Text(_average_value) => {
                                             // TODO: should have a count and set average value to highest count
+                                        }
+                                        SensorValue::Bool(_) => {
+                                            unreachable!();
                                         }
                                     }
                                 }
@@ -407,8 +438,10 @@ impl<'a> LibsensorsDataSource {
                                                 }
                                             }
                                         }
-                                        SensorValue::Bool(minimum_value) => {
-                                            if let SensorValue::Bool(current_value) = sensor_value {
+                                        SensorValue::RawBool(minimum_value) => {
+                                            if let SensorValue::RawBool(current_value) =
+                                                sensor_value
+                                            {
                                                 if current_value < *minimum_value {
                                                     sensor_data.minimum_value = sensor_value;
                                                 }
@@ -423,6 +456,9 @@ impl<'a> LibsensorsDataSource {
                                                 }
                                             }
                                         }
+                                        SensorValue::Bool(_) => {
+                                            unreachable!();
+                                        }
                                     }
                                 }
                                 match &sensor_data.maximum_value {
@@ -433,8 +469,8 @@ impl<'a> LibsensorsDataSource {
                                             }
                                         }
                                     }
-                                    SensorValue::Bool(maximum_value) => {
-                                        if let SensorValue::Bool(current_value) = sensor_value {
+                                    SensorValue::RawBool(maximum_value) => {
+                                        if let SensorValue::RawBool(current_value) = sensor_value {
                                             if current_value > *maximum_value {
                                                 sensor_data.maximum_value = sensor_value;
                                             }
@@ -446,6 +482,9 @@ impl<'a> LibsensorsDataSource {
                                                 sensor_data.maximum_value = sensor_value;
                                             }
                                         }
+                                    }
+                                    SensorValue::Bool(_) => {
+                                        unreachable!();
                                     }
                                 }
 
@@ -559,7 +598,7 @@ impl<'a> LibsensorsDataSource {
             | Value::CurrentCriticalAlarm(value)
             | Value::IntrusionAlarm(value)
             | Value::IntrusionBeep(value)
-            | Value::BeepEnable(value) => Ok(SensorValue::Bool(f64::from(i8::from(*value)))),
+            | Value::BeepEnable(value) => Ok(SensorValue::RawBool(f64::from(i8::from(*value)))),
 
             Value::TemperatureType(value) => Ok(SensorValue::Text(value.to_string())),
 
@@ -615,44 +654,31 @@ impl TransportInterface {
 #[derive(Debug)]
 pub struct QUICTransportInterface {
     serialized_sensor_data_sender: broadcast::Sender<Arc<Vec<u8>>>,
+    _tokio_runtime: tokio::runtime::Runtime, // must keep runtime in scope to keep quic_server_task_handle and other spawned tasks alive
     quic_server_task_handle: tokio::task::JoinHandle<()>,
 }
 
 impl<'a> QUICTransportInterface {
     const CERT_PEM: &'a str = "-----BEGIN CERTIFICATE-----
-    MIIBUjCB+aADAgECAgkAz1vuzG6opxQwCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwW
-    cmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEw
-    MTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMG
-    ByqGSM49AgEGCCqGSM49AwEHA0IABJHCy1MLoykAXS8sD1jXBDfpNeVzZAGJJ8Fv
-    Tu/7OrYj4kEomKbl0qn4uYK/wmEgPwjDoCe+2vg8FJTDT28txGSjGDAWMBQGA1Ud
-    EQQNMAuCCWxvY2FsaG9zdDAKBggqhkjOPQQDAgNIADBFAiBUOY7QT2ZUocjbt35I
-    f9C3ificV0wk6hvrp6sY4UQUTgIhAJFLMmmBC3o9NOJNaWpdTuUKFIzQZFl61gFu
-    MWcWnCgP
-    -----END CERTIFICATE-----";
+MIIBUjCB+aADAgECAgkAz1vuzG6opxQwCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwW
+cmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEw
+MTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABJHCy1MLoykAXS8sD1jXBDfpNeVzZAGJJ8Fv
+Tu/7OrYj4kEomKbl0qn4uYK/wmEgPwjDoCe+2vg8FJTDT28txGSjGDAWMBQGA1Ud
+EQQNMAuCCWxvY2FsaG9zdDAKBggqhkjOPQQDAgNIADBFAiBUOY7QT2ZUocjbt35I
+f9C3ificV0wk6hvrp6sY4UQUTgIhAJFLMmmBC3o9NOJNaWpdTuUKFIzQZFl61gFu
+MWcWnCgP
+-----END CERTIFICATE-----";
 
     const CERT_PRIVATE_KEY: &'a str = "-----BEGIN PRIVATE KEY-----
-    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgDdLdN7LoG7QQ5yk4
-    ufdOECGHysL92BBCRPN9xoV/qTmhRANCAASRwstTC6MpAF0vLA9Y1wQ36TXlc2QB
-    iSfBb07v+zq2I+JBKJim5dKp+LmCv8JhID8Iw6Anvtr4PBSUw09vLcRk
-    -----END PRIVATE KEY-----";
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgDdLdN7LoG7QQ5yk4
+ufdOECGHysL92BBCRPN9xoV/qTmhRANCAASRwstTC6MpAF0vLA9Y1wQ36TXlc2QB
+iSfBb07v+zq2I+JBKJim5dKp+LmCv8JhID8Iw6Anvtr4PBSUw09vLcRk
+-----END PRIVATE KEY-----";
 
+    #[must_use]
     pub fn new() -> Self {
-        let (serialized_sensor_data_sender, _serialized_sensor_data_receiver) =
-            broadcast::channel((2.0 / DEFAULT_UPDATE_PERIOD_SECONDS).ceil() as usize); // todo: configurable capacity?
-
-        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let quic_server_task_handle = tokio_runtime.spawn(Self::quic_server_task(
-            serialized_sensor_data_sender.clone(),
-        ));
-        // TODO: graceful shutdown of quic_server_task_handle
-
-        Self {
-            serialized_sensor_data_sender,
-            quic_server_task_handle,
-        }
+        Self::default()
     }
 
     async fn quic_server_task(sender: broadcast::Sender<Arc<Vec<u8>>>) {
@@ -665,28 +691,36 @@ impl<'a> QUICTransportInterface {
                 "[server] connection accepted: addr={}",
                 new_connection.connection.remote_address()
             );
-            let send = new_connection.connection.open_uni().await.unwrap();
-            tokio::spawn(Self::quic_conection_task(send, sender.subscribe()));
-        }
-        // TODO: graceful shutdown of connection tasks
-    }
-
-    async fn quic_conection_task(
-        mut send: quinn::SendStream,
-        mut receiver: broadcast::Receiver<Arc<Vec<u8>>>,
-    ) {
-        loop {
-            match receiver.recv().await {
-                Ok(serialized_message) => {
-                    send.write_all(serialized_message.as_slice()).await.unwrap();
-                }
-                Err(RecvError::Closed) => break,
-                Err(RecvError::Lagged(_)) => {
-                    eprintln!("Lagged!!!!!!!") // TODO: better error message
-                }
+            loop {
+                // TODO: exit condition?
+                let send_stream = new_connection.connection.open_uni().await.unwrap();
+                tokio::spawn(Self::quic_stream_task(send_stream, sender.subscribe()));
             }
         }
-        send.finish().await.unwrap()
+
+        // TODO: graceful shutdown of connection tasks
+        unreachable!("QUIC SERVER TASK ENDED PREMPTIVELY");
+    }
+
+    async fn quic_stream_task(
+        mut send_stream: quinn::SendStream,
+        mut receiver: broadcast::Receiver<Arc<Vec<u8>>>,
+    ) {
+        match receiver.recv().await {
+            Ok(serialized_message) => {
+                send_stream
+                    .write_all(serialized_message.as_slice())
+                    .await
+                    .unwrap();
+            }
+            Err(RecvError::Closed) => {
+                eprintln!("Server Closing?!!!!!!!"); // TODO: better error message
+            }
+            Err(RecvError::Lagged(_)) => {
+                eprintln!("Lagged!!!!!!!"); // TODO: better error message
+            }
+        }
+        send_stream.finish().await.unwrap();
     }
 
     fn make_server_endpoint(bind_addr: SocketAddr) -> Result<quinn::Incoming, Box<dyn Error>> {
@@ -728,139 +762,258 @@ impl<'a> QUICTransportInterface {
     }
 }
 
+impl Default for QUICTransportInterface {
+    fn default() -> Self {
+        let (serialized_sensor_data_sender, _serialized_sensor_data_receiver) =
+            broadcast::channel((2.0 / DEFAULT_UPDATE_PERIOD_SECONDS).ceil() as usize); // todo: configurable capacity?
+
+        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let quic_server_task_handle = tokio_runtime.spawn(Self::quic_server_task(
+            serialized_sensor_data_sender.clone(),
+        ));
+        // TODO: graceful shutdown of quic_server_task_handle
+
+        Self {
+            serialized_sensor_data_sender,
+            _tokio_runtime: tokio_runtime,
+            quic_server_task_handle,
+        }
+    }
+}
+
 /// client code
 pub struct CLIClient {}
 
-impl CLIClient {
-    // fn smth(){
-    // #[derive(Tabled)]
-    // struct Language {
-    //     name: &'static str,
-    //     designed_by: &'static str,
-    //     invented_year: usize,
-    // }
-    //
-    // let mut stdout = stdout();
-    // stdout.execute(cursor::Hide).unwrap();
-    //
-    // for year in 1950..2030 {
-    // let languages = vec ! [
-    // Language {
-    // name: "C",
-    // designed_by: "Dennis Ritchie",
-    // invented_year: 1972,
-    // },
-    // Language {
-    // name: "Rust",
-    // designed_by: "Graydon Hoare",
-    // invented_year: year,
-    // },
-    // Language {
-    // name: "Go",
-    // designed_by: "Rob Pike",
-    // invented_year: 2009,
-    // },
-    // ];
-    // let table_string = Table::new(languages).with(Style::rounded()).to_string();
-    // let num_newlines = table_string.chars().filter( | & c| c == '\n').count();
-    //
-    // stdout.queue(cursor::SavePosition).unwrap();
-    // stdout.write_all(table_string.as_bytes()).unwrap();
-    // stdout.flush().unwrap();
-    //
-    // thread::sleep(time::Duration::from_millis(200));
-    // stdout.queue(cursor::RestorePosition).unwrap();
-    // stdout.queue(cursor::MoveUp(num_newlines as u16)).unwrap(); // Required since: https://github.com/crossterm-rs/crossterm/issues/673
-    // stdout
-    // .queue(terminal::Clear(terminal::ClearType::FromCursorDown))
-    // .unwrap();
-    // }
-    //
-    // stdout.execute(cursor::Show).unwrap();
-    // println!("Done!");
+impl<'a> CLIClient {
+    const CERT_PEM: &'a str = "-----BEGIN CERTIFICATE-----
+MIIBUjCB+aADAgECAgkAz1vuzG6opxQwCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwW
+cmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEw
+MTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMG
+ByqGSM49AgEGCCqGSM49AwEHA0IABJHCy1MLoykAXS8sD1jXBDfpNeVzZAGJJ8Fv
+Tu/7OrYj4kEomKbl0qn4uYK/wmEgPwjDoCe+2vg8FJTDT28txGSjGDAWMBQGA1Ud
+EQQNMAuCCWxvY2FsaG9zdDAKBggqhkjOPQQDAgNIADBFAiBUOY7QT2ZUocjbt35I
+f9C3ificV0wk6hvrp6sY4UQUTgIhAJFLMmmBC3o9NOJNaWpdTuUKFIzQZFl61gFu
+MWcWnCgP
+-----END CERTIFICATE-----";
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn run(&self) -> crossterm::Result<()> {
+        // todo: resize window automatically
+
+        let (endpoint, mut uni_streams) = Self::create_quic_client().await;
+
+        while let Some(Ok(recv)) = uni_streams.next().await {
+            // Because it is a unidirectional stream, we can only receive not send back.
+            let serialized_message = match recv.read_to_end(1_000_000).await {
+                Ok(serialized_message) => serialized_message,
+                Err(err) => {
+                    panic!("{err}")
+                }
+            };
+
+            Self::print_serialized_message(&serialized_message).await?;
+        }
+
+        // Give the server has a chance to clean up
+        endpoint.wait_idle().await;
+        Ok(())
+    }
+
+    async fn create_quic_client() -> (Endpoint, IncomingUniStreams) {
+        let server_addr = "127.0.0.1:5000".parse().unwrap();
+
+        let cert_der = match rustls_pemfile::read_one(&mut Self::CERT_PEM.as_bytes())
+            .unwrap()
+            .unwrap()
+        {
+            rustls_pemfile::Item::X509Certificate(cert_der) => cert_der,
+            _ => {
+                unreachable!()
+            }
+        };
+
+        let mut cert_root_store = rustls::RootCertStore::empty();
+        cert_root_store.add(&rustls::Certificate(cert_der)).unwrap();
+
+        let client_cfg = quinn::ClientConfig::with_root_certificates(cert_root_store);
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_cfg);
+
+        let quinn::NewConnection {
+            connection,
+            uni_streams,
+            ..
+        } = endpoint
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap(); // todo: deal with timeout?
+        println!("[client] connected: addr={}", connection.remote_address());
+        (endpoint, uni_streams)
+    }
+
+    async fn print_serialized_message(serialized_message: &Vec<u8>) -> crossterm::Result<()> {
+        let mut stdout = stdout();
+
+        let num_newlines: u16;
+        {
+            let message_reader = capnp::serialize::read_message(
+                &mut serialized_message.as_slice(),
+                ::capnp::message::ReaderOptions::default(),
+            )
+            .unwrap();
+            let computer_info = message_reader
+                .get_root::<pchmd_capnp::computer_info::Reader>()
+                .unwrap();
+
+            stdout
+                .queue(crossterm::style::Print(format!(
+                    "Name: {}\n",
+                    computer_info.get_name().unwrap()
+                )))
+                .unwrap();
+            let (upper, lower) = (
+                computer_info.get_uuid_upper(),
+                computer_info.get_uuid_lower(),
+            );
+            stdout
+                .queue(crossterm::style::Print(format!(
+                    "UUID: {}\n",
+                    uuid::Uuid::from_u64_pair(upper, lower).hyphenated()
+                )))
+                .unwrap();
+
+            stdout
+                .queue(crossterm::style::Print(format!(
+                    "Operating System: {}\n",
+                    computer_info.get_operating_system().unwrap()
+                )))
+                .unwrap();
+
+            let version = computer_info.get_server_version().unwrap();
+            stdout
+                .queue(crossterm::style::Print(format!(
+                    "Server Version: {}.{}.{}\n",
+                    version.get_major(),
+                    version.get_minor(),
+                    version.get_patch()
+                )))
+                .unwrap();
+
+            let sensor_data_table =
+                Self::populate_sensor_data_table(computer_info.get_sensors().unwrap());
+            let table_string = tabled::Table::new(sensor_data_table)
+                .with(tabled::Style::rounded())
+                .to_string();
+            num_newlines = (table_string.chars().filter(|&c| c == '\n').count() + 4) as u16;
+            stdout.queue(crossterm::style::Print(table_string)).unwrap();
+            stdout.flush().unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Required since: https://github.com/crossterm-rs/crossterm/issues/673
+        stdout
+            .queue(crossterm::cursor::MoveToPreviousLine(num_newlines as u16))?
+            .queue(crossterm::terminal::Clear(
+                crossterm::terminal::ClearType::FromCursorDown,
+            ))?;
+        Ok(())
+    }
+
+    fn populate_sensor_data_table(
+        sensors: capnp::struct_list::Reader<pchmd_capnp::sensor_data::Owned>,
+    ) -> Vec<SensorDataCLITableEntry> {
+        let mut sensor_data_table = Vec::new();
+
+        for sensor in sensors.iter() {
+            sensor_data_table.push(SensorDataCLITableEntry {
+                sensor_name: sensor.get_sensor_name().unwrap().to_string(),
+                data_source_name: sensor.get_data_source_name().unwrap().to_string(),
+                current_value: match sensor.get_current().unwrap().which().unwrap() {
+                    pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
+                        SensorValue::Float(value)
+                    }
+                    pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
+                        SensorValue::Bool(value)
+                    }
+                    pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
+                        SensorValue::Text(value.unwrap().to_string())
+                    }
+                },
+                average_value: match sensor.get_average().unwrap().which().unwrap() {
+                    pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
+                        SensorValue::Float(value)
+                    }
+                    pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
+                        SensorValue::Bool(value)
+                    }
+                    pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
+                        SensorValue::Text(value.unwrap().to_string())
+                    }
+                },
+                minimum_value: match sensor.get_minimum().unwrap().which().unwrap() {
+                    pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
+                        SensorValue::Float(value)
+                    }
+                    pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
+                        SensorValue::Bool(value)
+                    }
+                    pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
+                        SensorValue::Text(value.unwrap().to_string())
+                    }
+                },
+                maximum_value: match sensor.get_maximum().unwrap().which().unwrap() {
+                    pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
+                        SensorValue::Float(value)
+                    }
+                    pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
+                        SensorValue::Bool(value)
+                    }
+                    pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
+                        SensorValue::Text(value.unwrap().to_string())
+                    }
+                },
+                // measurement_unit: match sensor.get_measurement_unit().unwrap() {
+                //
+                // },
+                is_stale: sensor.get_is_stale(),
+            });
+        }
+        sensor_data_table
+    }
 }
 
-// fn print_serialized_message(serialized_message: &mut Vec<u8>) {
-//     let message_reader = serialize_packed::read_message(
-//         &mut serialized_message.as_slice(),
-//         ::capnp::message::ReaderOptions::default(),
-//     ).unwrap();
-//     let computer_info = message_reader.get_root::<pchmd_capnp::computer_info::Reader>().unwrap();
-//
-//     println!("Name: {}", computer_info.get_name().unwrap());
-//     let (upper, lower) = (
-//         computer_info.get_uuid_upper(),
-//         computer_info.get_uuid_lower(),
-//     );
-//     println!("UUID: {}", uuid::Uuid::from_u64_pair(upper, lower).hyphenated());
-//     println!(
-//         "Operating System: {}",
-//         computer_info.get_operating_system().unwrap()
-//     );
-//     let version = computer_info.get_server_version().unwrap();
-//     println!(
-//         "Server Version: {}.{}.{}",
-//         version.get_major(),
-//         version.get_minor(),
-//         version.get_patch()
-//     );
-//     for sensor in computer_info.get_sensors().unwrap().iter() {
-//         println!(
-//             "{} from {}",
-//             sensor.get_sensor_name().unwrap(),
-//             sensor.get_data_source_name().unwrap()
-//         );
-//         print!("current: ");
-//         match sensor.get_current().unwrap().which().unwrap() {
-//             pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
-//                 print!("{value}");
-//             }
-//             pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
-//                 print!("{value}");
-//             }
-//             pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
-//                 print!("{}", value.unwrap());
-//             }
-//         };
-//
-//         print!(", average: ");
-//         match sensor.get_average().unwrap().which().unwrap() {
-//             pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
-//                 print!("{value}");
-//             }
-//             pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
-//                 print!("{value}");
-//             }
-//             pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
-//                 print!("{}", value.unwrap());
-//             }
-//         };
-//
-//         print!(", minimum: ");
-//         match sensor.get_minimum().unwrap().which().unwrap() {
-//             pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
-//                 print!("{value}");
-//             }
-//             pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
-//                 print!("{value}");
-//             }
-//             pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
-//                 print!("{}", value.unwrap());
-//             }
-//         };
-//
-//         print!(", maximum: ");
-//         match sensor.get_maximum().unwrap().which().unwrap() {
-//             pchmd_capnp::sensor_value::WhichReader::FloatValue(value) => {
-//                 print!("{value}");
-//             }
-//             pchmd_capnp::sensor_value::WhichReader::BoolValue(value) => {
-//                 print!("{value}");
-//             }
-//             pchmd_capnp::sensor_value::WhichReader::StringValue(value) => {
-//                 print!("{}", value.unwrap());
-//             }
-//         };
-//     }
-// }
-// }
+impl Default for CLIClient {
+    fn default() -> Self {
+        stdout().execute(crossterm::cursor::Hide).unwrap();
+        Self {}
+    }
+}
+
+impl Drop for CLIClient {
+    fn drop(&mut self) {
+        stdout().execute(crossterm::cursor::Show).unwrap();
+    }
+}
+
+#[derive(Tabled)]
+struct SensorDataCLITableEntry {
+    sensor_name: String,
+    data_source_name: String,
+
+    current_value: SensorValue,
+    average_value: SensorValue,
+    minimum_value: SensorValue,
+    maximum_value: SensorValue,
+
+    // measurement_unit: Option<MeasurementUnit>,
+    is_stale: bool,
+}

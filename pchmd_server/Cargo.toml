@@ -1,7 +1,13 @@
 [package]
 name = "pchmd_server"
-version = "0.1.0"
+description = "PC Hardware Monitoring Display: Cross-Platform GUI and back-end designed to display PC sensor data(ex. Temps, Clocks, etc.) on a separate display (local or external)"
+repository = "https://github.com/wmmc88/pchmd"
 authors = ["Melvin Wang <melvin.mc.wang@gmail.com>"]
+version = "0.1.0"
+license = "MIT"
+keywords = ["pchmd", "hardware", "monitoring", "sensors"]
+categories = ["visualization", "hardware-support"]
+readme = "README.md"
 edition = "2021"
 
 [dependencies]
@@ -18,11 +24,11 @@ rand = "0.8.5"
 rand_pcg = "0.3.1"
 rand_seeder = "0.2.3"
 rcgen = "0.9.2"
-rustls = { version = "0.20.6", features = ["quic", "dangerous_configuration"] }
-rustls-pemfile = "1.0.0"
+rustls = { version = "0.20.6", features = ["quic"] }
+rustls-pemfile = "0.2.1"
 tabled = "0.7.0"
-tokio = { version = "1.18.2", features = ["full"] }
-uuid = "1.1.0"
+tokio = { version = "1.19.0", features = ["full"] }
+uuid = "1.1.1"
 
 [build-dependencies]
 capnpc = "0.14.7"
