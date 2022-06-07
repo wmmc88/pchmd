@@ -659,31 +659,14 @@ pub struct QUICTransportInterface {
 }
 
 impl<'a> QUICTransportInterface {
-    const CERT_PEM: &'a str = "-----BEGIN CERTIFICATE-----
-MIIBUjCB+aADAgECAgkAz1vuzG6opxQwCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwW
-cmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEw
-MTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMG
-ByqGSM49AgEGCCqGSM49AwEHA0IABJHCy1MLoykAXS8sD1jXBDfpNeVzZAGJJ8Fv
-Tu/7OrYj4kEomKbl0qn4uYK/wmEgPwjDoCe+2vg8FJTDT28txGSjGDAWMBQGA1Ud
-EQQNMAuCCWxvY2FsaG9zdDAKBggqhkjOPQQDAgNIADBFAiBUOY7QT2ZUocjbt35I
-f9C3ificV0wk6hvrp6sY4UQUTgIhAJFLMmmBC3o9NOJNaWpdTuUKFIzQZFl61gFu
-MWcWnCgP
------END CERTIFICATE-----";
-
-    const CERT_PRIVATE_KEY: &'a str = "-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgDdLdN7LoG7QQ5yk4
-ufdOECGHysL92BBCRPN9xoV/qTmhRANCAASRwstTC6MpAF0vLA9Y1wQ36TXlc2QB
-iSfBb07v+zq2I+JBKJim5dKp+LmCv8JhID8Iw6Anvtr4PBSUw09vLcRk
------END PRIVATE KEY-----";
-
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     async fn quic_server_task(sender: broadcast::Sender<Arc<Vec<u8>>>) {
-        let server_addr = "127.0.0.1:5000".parse().unwrap(); // TODO: configurable
-        let mut incoming = Self::make_server_endpoint(server_addr).unwrap();
+        let server_addr = "127.0.0.1:5000".parse().unwrap(); // TODO: configurable address
+        let mut incoming = Self::make_server_endpoint(server_addr).unwrap(); // todo: handle error gracefully
 
         while let Some(conn) = incoming.next().await {
             let new_connection = conn.await.unwrap();
@@ -724,30 +707,14 @@ iSfBb07v+zq2I+JBKJim5dKp+LmCv8JhID8Iw6Anvtr4PBSUw09vLcRk
     }
 
     fn make_server_endpoint(bind_addr: SocketAddr) -> Result<quinn::Incoming, Box<dyn Error>> {
-        let cert_der = match rustls_pemfile::read_one(&mut Self::CERT_PEM.as_bytes())
-            .unwrap()
-            .unwrap()
-        {
-            rustls_pemfile::Item::X509Certificate(cert_der) => cert_der,
-            _ => {
-                unreachable!()
-            }
-        };
-        let cert_chain = vec![rustls::Certificate(cert_der)];
-
-        let private_key_der = match rustls_pemfile::read_one(&mut Self::CERT_PRIVATE_KEY.as_bytes())
-            .unwrap()
-            .unwrap()
-        {
-            rustls_pemfile::Item::PKCS8Key(private_key_der) => private_key_der,
-
-            _ => {
-                unreachable!()
-            }
-        };
-        let private_key = rustls::PrivateKey(private_key_der);
-
-        let server_config = quinn::ServerConfig::with_single_cert(cert_chain, private_key)?;
+        let server_config = quinn::ServerConfig::with_single_cert(
+            vec![rustls::Certificate(
+                utils::get_and_validate_ssl_certificate(&utils::get_ssl_certificate_path())?,
+            )],
+            rustls::PrivateKey(utils::get_and_validate_ssl_private_key(
+                &utils::get_ssl_private_key_path(),
+            )?),
+        )?;
         let (_endpoint, incoming) = Endpoint::server(server_config, bind_addr)?;
         Ok(incoming)
     }
@@ -788,17 +755,6 @@ impl Default for QUICTransportInterface {
 pub struct CLIClient {}
 
 impl<'a> CLIClient {
-    const CERT_PEM: &'a str = "-----BEGIN CERTIFICATE-----
-MIIBUjCB+aADAgECAgkAz1vuzG6opxQwCgYIKoZIzj0EAwIwITEfMB0GA1UEAwwW
-cmNnZW4gc2VsZiBzaWduZWQgY2VydDAgFw03NTAxMDEwMDAwMDBaGA80MDk2MDEw
-MTAwMDAwMFowITEfMB0GA1UEAwwWcmNnZW4gc2VsZiBzaWduZWQgY2VydDBZMBMG
-ByqGSM49AgEGCCqGSM49AwEHA0IABJHCy1MLoykAXS8sD1jXBDfpNeVzZAGJJ8Fv
-Tu/7OrYj4kEomKbl0qn4uYK/wmEgPwjDoCe+2vg8FJTDT28txGSjGDAWMBQGA1Ud
-EQQNMAuCCWxvY2FsaG9zdDAKBggqhkjOPQQDAgNIADBFAiBUOY7QT2ZUocjbt35I
-f9C3ificV0wk6hvrp6sY4UQUTgIhAJFLMmmBC3o9NOJNaWpdTuUKFIzQZFl61gFu
-MWcWnCgP
------END CERTIFICATE-----";
-
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -807,7 +763,7 @@ MWcWnCgP
     pub async fn run(&self) -> crossterm::Result<()> {
         // todo: resize window automatically
 
-        let (endpoint, mut uni_streams) = Self::create_quic_client().await;
+        let (endpoint, mut uni_streams) = Self::create_quic_client().await.unwrap(); // TODO: handle error
 
         while let Some(Ok(recv)) = uni_streams.next().await {
             // Because it is a unidirectional stream, we can only receive not send back.
@@ -826,21 +782,15 @@ MWcWnCgP
         Ok(())
     }
 
-    async fn create_quic_client() -> (Endpoint, IncomingUniStreams) {
-        let server_addr = "127.0.0.1:5000".parse().unwrap();
-
-        let cert_der = match rustls_pemfile::read_one(&mut Self::CERT_PEM.as_bytes())
-            .unwrap()
-            .unwrap()
-        {
-            rustls_pemfile::Item::X509Certificate(cert_der) => cert_der,
-            _ => {
-                unreachable!()
-            }
-        };
+    async fn create_quic_client() -> Result<(Endpoint, IncomingUniStreams), String> {
+        let server_addr = "127.0.0.1:5000".parse().unwrap(); // TODO: configurable address
 
         let mut cert_root_store = rustls::RootCertStore::empty();
-        cert_root_store.add(&rustls::Certificate(cert_der)).unwrap();
+        cert_root_store
+            .add(&rustls::Certificate(
+                utils::get_and_validate_ssl_certificate(&utils::get_ssl_certificate_path())?,
+            ))
+            .unwrap();
 
         let client_cfg = quinn::ClientConfig::with_root_certificates(cert_root_store);
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
@@ -851,12 +801,12 @@ MWcWnCgP
             uni_streams,
             ..
         } = endpoint
-            .connect(server_addr, "localhost")
+            .connect(server_addr, "localhost") // TODO: configurable address
             .unwrap()
             .await
             .unwrap(); // todo: deal with timeout?
         println!("[client] connected: addr={}", connection.remote_address());
-        (endpoint, uni_streams)
+        Ok((endpoint, uni_streams))
     }
 
     async fn print_serialized_message(serialized_message: &Vec<u8>) -> crossterm::Result<()> {
@@ -1016,4 +966,191 @@ struct SensorDataCLITableEntry {
 
     // measurement_unit: Option<MeasurementUnit>,
     is_stale: bool,
+}
+
+pub struct SSLCertificateGenerator;
+impl SSLCertificateGenerator {
+    /// # Errors
+    ///
+    /// Will return `Err` in the following situations:
+    /// * failed to create config directory
+    /// * valid certificate-private key pair already exists
+    /// * I/O error when saving new certificate/private key
+    ///
+    /// # Panics
+    ///
+    /// Will only panic if there's a bug in this library
+    pub fn run() -> Result<(), String> {
+        let config_directory_path = utils::get_config_directory_path();
+        if let Some(error) =
+            utils::create_config_directory_if_needed(config_directory_path.as_path()).err()
+        {
+            return Err(format!(
+                "Failed to create config directory({}): {}",
+                config_directory_path.display(),
+                error
+            ));
+        }
+
+        let certificate_file = utils::get_ssl_certificate_path();
+        let private_key_file = utils::get_ssl_private_key_path();
+        if utils::get_and_validate_ssl_certificate(&certificate_file).is_ok()
+            && utils::get_and_validate_ssl_private_key(&private_key_file).is_ok()
+        {
+            // has existing certificates and keys
+            if !dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default()).with_prompt(format!("Valid ssl certificate and private key exist at {} and {}. Do you want to overwrite them?", certificate_file.display(), private_key_file.display())).default(false).interact().expect("IO error on user input prompt") || !dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default()).with_prompt("Are you sure? The original certificate and private key files will no longer exist.").default(false).interact().expect("IO error on user input prompt") {
+                return Err("new certificate and private key not generated".to_string())
+            }
+        }
+
+        let (certificate_pem, private_key_pem) = utils::generate_certificate();
+        match utils::save_certificate(
+            certificate_pem.as_str(),
+            private_key_pem.as_str(),
+            &certificate_file,
+            &private_key_file,
+        ) {
+            Ok(_) => {
+                println!(
+                    "new certificate and private key generated in {} and {}",
+                    certificate_file.display(),
+                    private_key_file.display()
+                );
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to save certificate and private key in {} and {}: {err}",
+                    certificate_file.display(),
+                    private_key_file.display()
+                ))
+            }
+        }
+        Ok(())
+    }
+}
+
+mod utils {
+    use std::io::Write;
+
+    pub const CERTIFICATE_FILE_NAME: &str = "pchmd.crt";
+    pub const PRIVATE_KEY_FILE_NAME: &str = "pchmd.key";
+
+    pub fn get_config_directory_path() -> std::path::PathBuf {
+        platform_dirs::AppDirs::new(Some(env!("CARGO_PKG_NAME")), false)
+            .unwrap()
+            .config_dir
+    }
+
+    pub fn create_config_directory_if_needed(
+        config_dir_path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        std::fs::create_dir_all(config_dir_path)
+    }
+
+    pub fn get_ssl_certificate_path() -> std::path::PathBuf {
+        get_config_directory_path().join(CERTIFICATE_FILE_NAME)
+    }
+
+    pub fn get_ssl_private_key_path() -> std::path::PathBuf {
+        get_config_directory_path().join(PRIVATE_KEY_FILE_NAME)
+    }
+
+    pub fn get_and_validate_ssl_certificate(
+        certificate_file_path: &std::path::Path,
+    ) -> Result<Vec<u8>, String> {
+        if !certificate_file_path.exists() {
+            return Err(format!(
+                "certificate file does not exist at {}",
+                certificate_file_path.display()
+            ));
+        }
+
+        match rustls_pemfile::read_one(
+            &mut std::fs::read(certificate_file_path)
+                .unwrap_or_else(|_| {
+                    panic!("failed to read file: {}", certificate_file_path.display())
+                })
+                .as_slice(),
+        )
+        .unwrap_or_else(|_| {
+            panic!(
+                "IO Error while reading certificate in {}",
+                certificate_file_path.display()
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "failed to find PEM section while reading certificate in {}",
+                certificate_file_path.display()
+            )
+        }) {
+            rustls_pemfile::Item::X509Certificate(certificate) => Ok(certificate),
+            _ => {
+                return Err(format!(
+                    "certificate in {} must be DER-encoded x509 certificate",
+                    certificate_file_path.display()
+                ))
+            }
+        }
+    }
+
+    pub fn get_and_validate_ssl_private_key(
+        private_key_file_path: &std::path::Path,
+    ) -> Result<Vec<u8>, String> {
+        if !private_key_file_path.exists() {
+            return Err(format!(
+                "private key file does not exist at {}",
+                private_key_file_path.display()
+            ));
+        }
+
+        match rustls_pemfile::read_one(
+            &mut std::fs::read(private_key_file_path)
+                .unwrap_or_else(|_| panic!("failed to read file: {}", private_key_file_path.display()))
+                .as_slice(),
+        )
+            .unwrap_or_else(|_| panic!("IO Error while reading private key in {}",
+                                       private_key_file_path.display()))
+            .unwrap_or_else(|| panic!("failed to find PEM section while reading private key in {}",
+                                      private_key_file_path.display())) {
+            rustls_pemfile::Item::PKCS8Key(private_key) => {
+                Ok(private_key)
+            }
+            _ => {
+                Err(format!(
+                    "private key in {} must be DER-encoded plaintext private key (as specified in PKCS#8/RFC5958)",
+                    private_key_file_path.display()
+                ))
+            }
+        }
+    }
+
+    pub fn generate_certificate() -> (String, String) {
+        let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap(); // TODO: configurable address
+        (
+            certificate.serialize_pem().unwrap(),
+            certificate.serialize_private_key_pem(),
+        )
+    }
+
+    pub fn save_certificate(
+        certificate_pem: &str,
+        private_key_pem: &str,
+        certificate_file_path: &std::path::Path,
+        private_key_file_path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        {
+            let mut certificate_file = std::fs::File::create(certificate_file_path)?;
+            certificate_file.write_all(certificate_pem.as_bytes())?;
+            certificate_file.sync_all()?;
+        }
+
+        {
+            let mut private_key_file = std::fs::File::create(private_key_file_path)?;
+            private_key_file.write_all(private_key_pem.as_bytes())?;
+            private_key_file.sync_all()?;
+        }
+
+        Ok(())
+    }
 }

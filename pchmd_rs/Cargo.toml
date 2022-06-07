@@ -14,6 +14,7 @@ edition = "2021"
 capnp = "0.14.6"
 chrono = "0.4.19"
 crossterm = "0.23.2"
+dialoguer = "0.10.1"
 futures-util = "0.3.21"
 hostname = "0.3.1"
 jemallocator = "0.5.0"
@@ -26,9 +27,9 @@ rand_pcg = "0.3.1"
 rand_seeder = "0.2.3"
 rcgen = "0.9.2"
 rustls = { version = "0.20.6", features = ["quic"] }
-rustls-pemfile = "0.2.1"
+rustls-pemfile = "1.0.0"
 tabled = "0.7.0"
-tokio = { version = "1.19.0", features = ["full"] }
+tokio = { version = "1.19.2", features = ["full"] }
 uuid = "1.1.1"
 
 [build-dependencies]
