@@ -1,4 +1,4 @@
-use pchmd_server::*;
+use pchmd::*;
 
 #[test]
 fn match_capnproto_and_cargo_version() {

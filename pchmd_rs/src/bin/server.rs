@@ -1,4 +1,4 @@
-use pchmd_server::*;
+use pchmd::*;
 
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;

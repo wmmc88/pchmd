@@ -1,5 +1,5 @@
 [package]
-name = "pchmd_server"
+name = "pchmd"
 description = "PC Hardware Monitoring Display: Cross-Platform GUI and back-end designed to display PC sensor data(ex. Temps, Clocks, etc.) on a separate display (local or external)"
 repository = "https://github.com/wmmc88/pchmd"
 authors = ["Melvin Wang <melvin.mc.wang@gmail.com>"]
@@ -19,6 +19,7 @@ hostname = "0.3.1"
 jemallocator = "0.5.0"
 lm-sensors = "0.1.4"
 mac_address = "1.1.3"
+platform-dirs = "0.3.0"
 quinn = "0.8.3"
 rand = "0.8.5"
 rand_pcg = "0.3.1"
