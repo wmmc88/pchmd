@@ -664,45 +664,59 @@ impl<'a> QUICTransportInterface {
         Self::default()
     }
 
-    async fn quic_server_task(sender: broadcast::Sender<Arc<Vec<u8>>>) {
+    async fn quic_server_task(serialized_sensor_data_sender: broadcast::Sender<Arc<Vec<u8>>>) {
         let server_addr = "127.0.0.1:5000".parse().unwrap(); // TODO: configurable address
         let mut incoming = Self::make_server_endpoint(server_addr).unwrap(); // todo: handle error gracefully
 
-        while let Some(conn) = incoming.next().await {
-            let new_connection = conn.await.unwrap();
-            println!(
-                "[server] connection accepted: addr={}",
-                new_connection.connection.remote_address()
-            );
-            loop {
-                // TODO: exit condition?
-                let send_stream = new_connection.connection.open_uni().await.unwrap();
-                tokio::spawn(Self::quic_stream_task(send_stream, sender.subscribe()));
-            }
+        while let Some(connecting) = incoming.next().await {
+            let _join_handle = tokio::spawn(Self::client_connection_task(
+                connecting,
+                serialized_sensor_data_sender.subscribe(),
+            ));
         }
 
         // TODO: graceful shutdown of connection tasks
         unreachable!("QUIC SERVER TASK ENDED PREMPTIVELY");
     }
 
-    async fn quic_stream_task(
-        mut send_stream: quinn::SendStream,
-        mut receiver: broadcast::Receiver<Arc<Vec<u8>>>,
+    async fn client_connection_task(
+        connecting_connection: quinn::Connecting,
+        mut serialized_sensor_data_receiver: broadcast::Receiver<Arc<Vec<u8>>>,
     ) {
-        match receiver.recv().await {
-            Ok(serialized_message) => {
-                send_stream
-                    .write_all(serialized_message.as_slice())
-                    .await
-                    .unwrap();
-            }
-            Err(RecvError::Closed) => {
-                eprintln!("Server Closing?!!!!!!!"); // TODO: better error message
-            }
-            Err(RecvError::Lagged(_)) => {
-                eprintln!("Lagged!!!!!!!"); // TODO: better error message
+        let new_connection = connecting_connection.await.unwrap();
+        println!(
+            "[server] connection accepted: addr={}",
+            new_connection.connection.remote_address()
+        );
+
+        // TODO: exit condition based off of error in send_one_client_stream_task?
+        loop {
+            match serialized_sensor_data_receiver.recv().await {
+                Ok(serialized_message) => {
+                    tokio::spawn(Self::send_one_client_stream_task(new_connection.connection.open_uni(), serialized_message));
+                    // TODO: handle cleanup of join handles?
+                }
+                Err(RecvError::Closed) => {
+                    eprintln!("Server Closing?!!!!!!!"); // TODO: better error message
+                    break;
+                }
+                Err(RecvError::Lagged(_)) => {
+                    eprintln!("Lagged!!!!!!!"); // TODO: better error message
+                    break;
+                }
             }
         }
+    }
+
+    async fn send_one_client_stream_task(
+        send_stream_future: quinn::OpenUni,
+        serialized_message: Arc<Vec<u8>>,
+    ) {
+        let mut send_stream = send_stream_future.await.unwrap();
+        send_stream
+            .write_all(serialized_message.as_slice())
+            .await
+            .unwrap();
         send_stream.finish().await.unwrap();
     }
 
