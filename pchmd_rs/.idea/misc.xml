@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="UnattendedHostPersistenceState">
+    <option name="openedFilesInfos">
+      <list>
+        <OpenedFileInfo>
+          <option name="caretOffset" value="14169" />
+          <option name="fileUrl" value="file://$PROJECT_DIR$/src/lib.rs" />
+        </OpenedFileInfo>
+        <OpenedFileInfo>
+          <option name="caretOffset" value="566" />
+          <option name="fileUrl" value="file://$PROJECT_DIR$/Cargo.toml" />
+        </OpenedFileInfo>
+        <OpenedFileInfo>
+          <option name="caretOffset" value="265" />
+          <option name="fileUrl" value="file://$PROJECT_DIR$/src/bin/server.rs" />
+        </OpenedFileInfo>
+        <OpenedFileInfo>
+          <option name="caretOffset" value="28" />
+          <option name="fileUrl" value="file://$PROJECT_DIR$/.cargo/config.toml" />
+        </OpenedFileInfo>
+        <OpenedFileInfo>
+          <option name="caretOffset" value="204" />
+          <option name="fileUrl" value="file://$PROJECT_DIR$/src/bin/cli-client.rs" />
+        </OpenedFileInfo>
+      </list>
+    </option>
+  </component>
+</project>
