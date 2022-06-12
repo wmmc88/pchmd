@@ -5,28 +5,23 @@
 
 extern crate core;
 
-use std::{error::Error, net::SocketAddr, sync::Arc};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{stdout, Write};
 use std::time::{Duration, Instant};
+use std::{error::Error, net::SocketAddr, sync::Arc};
 
 use capnp::serialize;
 use crossterm::{ExecutableCommand, QueueableCommand};
 use futures_util::StreamExt;
 use lm_sensors::prelude::*;
-use lm_sensors::Value;
 use lm_sensors::value::Unit;
-use quinn::{Endpoint, IncomingUniStreams, WriteError};
+use lm_sensors::Value;
+use quinn::{ConnectionError, Endpoint, IncomingUniStreams, NewConnection, WriteError};
 use rand::prelude::*;
 use rand_pcg::Pcg64Mcg;
 use rand_seeder::Seeder;
 use tabled::Tabled;
-use tokio::sync::broadcast;
-use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::oneshot::Sender;
-use tokio::task::{JoinHandle};
 
 pub mod pchmd_capnp {
     #![allow(clippy::all)]
@@ -114,7 +109,7 @@ impl Server {
             let uuid = uuid::Builder::from_random_bytes(
                 Seeder::from(mac_address).make_rng::<Pcg64Mcg>().gen(),
             )
-                .into_uuid();
+            .into_uuid();
             let (upper, lower) = uuid.as_u64_pair();
             computer_info.set_uuid_upper(upper);
             computer_info.set_uuid_lower(lower);
@@ -414,7 +409,7 @@ impl<'a> LibsensorsDataSource {
                                         }
                                         SensorValue::RawBool(average_value) => {
                                             if let SensorValue::RawBool(current_value) =
-                                            sensor_value
+                                                sensor_value
                                             {
                                                 let average_value = ewma_alpha_value
                                                     * current_value
@@ -444,7 +439,7 @@ impl<'a> LibsensorsDataSource {
                                         }
                                         SensorValue::RawBool(minimum_value) => {
                                             if let SensorValue::RawBool(current_value) =
-                                            sensor_value
+                                                sensor_value
                                             {
                                                 if current_value < *minimum_value {
                                                     sensor_data.minimum_value = sensor_value;
@@ -453,7 +448,7 @@ impl<'a> LibsensorsDataSource {
                                         }
                                         SensorValue::Text(minimum_value) => {
                                             if let SensorValue::Text(ref current_value) =
-                                            sensor_value
+                                                sensor_value
                                             {
                                                 if *current_value < *minimum_value {
                                                     sensor_data.minimum_value = sensor_value;
@@ -657,7 +652,7 @@ impl TransportInterface {
 
 #[derive(Debug)]
 pub struct QUICTransportInterface {
-    serialized_sensor_data_sender: broadcast::Sender<Arc<Vec<u8>>>,
+    serialized_sensor_data_sender: tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
 
     // must keep runtime in scope to keep quic_server_task_handle and other spawned tasks alive
     _tokio_runtime: tokio::runtime::Runtime,
@@ -669,39 +664,84 @@ impl<'a> QUICTransportInterface {
         Self::default()
     }
 
-    async fn quic_server_task(serialized_sensor_data_sender: broadcast::Sender<Arc<Vec<u8>>>) {
+    async fn quic_server_task(
+        serialized_sensor_data_sender: tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
+    ) {
         let server_addr = "127.0.0.1:5000".parse().unwrap(); // TODO: configurable address
         let mut incoming = Self::make_server_endpoint(server_addr).unwrap(); // todo: handle error gracefully
 
-        while let Some(connecting) = incoming.next().await {
-            let _join_handle = tokio::spawn(Self::client_connection_task(
-                connecting,
-                serialized_sensor_data_sender.subscribe(),
-            ));
+        let mut server_running = true;
+        let (shutdown_signal_sender, shutdown_signal_receiver) = tokio::sync::watch::channel(false);
+        let mut client_connection_task_handles = Vec::new();
+        while server_running {
+            tokio::select! {
+                biased;
+
+                ctrl_c_sig_result = tokio::signal::ctrl_c() => {
+                    match ctrl_c_sig_result {
+                        Ok(()) => {
+                            println!();
+                            eprintln!("Shutting down quic_transport_interface");
+                        },
+                        Err(err) => {
+                            eprintln!("Unable to listen for shutdown signal: {}", err);
+                            // we also shut down in case of error
+                        },
+                    }
+                    server_running = false;
+                    shutdown_signal_sender.send(true).expect("All QUICTransportInterface shutdown signal receivers have closed");
+                }
+
+                Some(connecting) = incoming.next() => {
+                    client_connection_task_handles.push(tokio::spawn(Self::client_connection_task(
+                        connecting,
+                        shutdown_signal_receiver.clone(),
+                        serialized_sensor_data_sender.subscribe(),
+                    )));
+                }
+            }
         }
 
-        // TODO: graceful shutdown of connection tasks: https://tokio.rs/tokio/topics/shutdown
-        unreachable!("QUIC SERVER TASK ENDED PREMPTIVELY");
+        let num_client_connection_task_handles = client_connection_task_handles.len();
+        for (i, handle) in client_connection_task_handles.into_iter().enumerate() {
+            match handle.await {
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("Failed to join client_connection_task[{i}/{num_client_connection_task_handles}] handle: {error}");
+                }
+            }
+        }
     }
 
     async fn client_connection_task(
         connecting_connection: quinn::Connecting,
-        mut serialized_sensor_data_receiver: broadcast::Receiver<Arc<Vec<u8>>>,
+        mut shutdown_signal_receiver: tokio::sync::watch::Receiver<bool>,
+        mut serialized_sensor_data_receiver: tokio::sync::broadcast::Receiver<Arc<Vec<u8>>>,
     ) {
-        let new_connection = connecting_connection.await.unwrap();
+        let new_connection = connecting_connection.await.unwrap(); // todo: handle failed connection during shutdown
         println!(
             "[server] connection accepted: addr={}",
             new_connection.connection.remote_address()
         );
 
-        let (client_stream_handles_sender, client_stream_handles_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (connection_lost_sender, mut connection_lost_receiver) = tokio::sync::oneshot::channel();
-        let client_connection_monitor_handle = tokio::spawn(Self::client_connection_monitor_task(client_stream_handles_receiver, connection_lost_sender));
+        let (client_stream_handles_sender, client_stream_handles_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        let (connection_lost_sender, mut connection_lost_receiver) =
+            tokio::sync::oneshot::channel();
+        let client_connection_monitor_task_handle =
+            tokio::spawn(Self::client_connection_monitor_task(
+                client_stream_handles_receiver,
+                connection_lost_sender,
+            ));
 
         let mut connection_active = true;
         while connection_active {
             tokio::select! {
                 biased;
+
+                _ = shutdown_signal_receiver.changed()=> {
+                    connection_active = false;
+                }
 
                 _ = &mut connection_lost_receiver => {
                     connection_active = false;
@@ -709,11 +749,11 @@ impl<'a> QUICTransportInterface {
 
                 serialized_sensor_data = serialized_sensor_data_receiver.recv()=>{
                     match serialized_sensor_data {
-                        Err(RecvError::Closed) => {
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         eprintln!("Server Closing?!!!!!!!"); // TODO: better error message
                         connection_active = false;
                         }
-                        Err(RecvError::Lagged(_)) => {
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                             eprintln!("Lagged!!!!!!!"); // TODO: better error message
                         }
                         Ok(serialized_message) => {
@@ -723,45 +763,41 @@ impl<'a> QUICTransportInterface {
                 }
             }
         }
+        drop(client_stream_handles_sender); // also signals client_connection_monitor_task to shutdown
 
-        match client_connection_monitor_handle.await {
+        match client_connection_monitor_task_handle.await {
             Ok(_) => {}
             Err(error) => {
-                eprintln!("Failed to join client_connection_monitor handle: {error}");
+                eprintln!("Failed to join client_connection_monitor_task handle: {error}");
             }
         }
     }
 
-    async fn client_connection_monitor_task(mut client_stream_handles_receiver: UnboundedReceiver<JoinHandle<Result<(), WriteError>>>, connection_lost_sender: Sender<()>) {
+    async fn client_connection_monitor_task(
+        mut client_stream_handles_receiver: tokio::sync::mpsc::UnboundedReceiver<
+            tokio::task::JoinHandle<Result<(), WriteError>>,
+        >,
+        connection_lost_sender: tokio::sync::oneshot::Sender<()>,
+    ) {
         loop {
             match client_stream_handles_receiver.recv().await {
                 None => {
-                    // connection terminated and client_stream_handles_sender dropped
+                    // connection terminated and/or client_stream_handles_sender dropped
+                    drop(connection_lost_sender);
                     return;
                 }
                 Some(client_stream_task_join_handle) => {
                     match client_stream_task_join_handle.await {
                         Ok(client_stream_task_result) => {
-                            match client_stream_task_result {
-                                Ok(()) => {
-                                    continue;
+                            if client_stream_task_result != Ok(()) {
+                                if connection_lost_sender.send(()).is_err() {
+                                    eprintln!("Failed to send connection lost signal to client_connection_monitor_task");
                                 }
-                                Err(_) => {
-                                    match connection_lost_sender.send(()) {
-                                        Ok(_) => {
-                                            return;
-                                        }
-                                        Err(_) => {
-                                            eprintln!("Failed to send connection lost signal to client_connection_monitor_task");
-                                            return;
-                                        }
-                                    }
-                                }
+                                return;
                             }
                         }
                         Err(error) => {
                             eprintln!("Failed to join client_stream_task handle: {error}");
-                            continue;
                         }
                     }
                 }
@@ -773,10 +809,8 @@ impl<'a> QUICTransportInterface {
         send_stream_future: quinn::OpenUni,
         serialized_message: Arc<Vec<u8>>,
     ) -> Result<(), quinn::WriteError> {
-        let mut send_stream = send_stream_future.await.unwrap();
-        send_stream
-            .write_all(serialized_message.as_slice())
-            .await?;
+        let mut send_stream = send_stream_future.await?;
+        send_stream.write_all(serialized_message.as_slice()).await?;
         send_stream.finish().await?;
         Ok(())
     }
@@ -807,7 +841,7 @@ impl<'a> QUICTransportInterface {
 impl Default for QUICTransportInterface {
     fn default() -> Self {
         let (serialized_sensor_data_sender, _serialized_sensor_data_receiver) =
-            broadcast::channel((2.0 / DEFAULT_UPDATE_PERIOD_SECONDS).ceil() as usize); // todo: configurable capacity?
+            tokio::sync::broadcast::channel((2.0 / DEFAULT_UPDATE_PERIOD_SECONDS).ceil() as usize); // todo: configurable capacity?
 
         let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -836,23 +870,76 @@ impl<'a> CLIClient {
     pub async fn run(&self) -> crossterm::Result<()> {
         // todo: resize window automatically
 
-        let (endpoint, mut uni_streams) = Self::create_quic_client().await.unwrap(); // TODO: handle error
+        let (shutdown_signal_sender, shutdown_signal_receiver) = tokio::sync::watch::channel(false);
+        let quic_client_task_handle =
+            tokio::spawn(Self::run_quic_client_task(shutdown_signal_receiver));
 
-        while let Some(Ok(recv)) = uni_streams.next().await {
-            // Because it is a unidirectional stream, we can only receive not send back.
-            let serialized_message = match recv.read_to_end(1_000_000).await {
-                Ok(serialized_message) => serialized_message,
-                Err(err) => {
-                    panic!("{err}")
-                }
-            };
-
-            Self::print_serialized_message(&serialized_message).await?;
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                println!();
+                eprintln!("Shutting down pchmd CLIClient");
+            }
+            Err(err) => {
+                eprintln!("Unable to listen for shutdown signal: {}", err);
+                // we also shut down in case of error
+            }
         }
+        shutdown_signal_sender
+            .send(true)
+            .expect("All CLIClient shutdown signal receivers have closed");
 
-        // Give the server has a chance to clean up
-        endpoint.wait_idle().await;
-        Ok(())
+        quic_client_task_handle.await?
+    }
+
+    async fn run_quic_client_task(
+        mut shutdown_signal_receiver: tokio::sync::watch::Receiver<bool>,
+    ) -> crossterm::Result<()> {
+        loop {
+            tokio::select! {
+                biased;
+
+                _ = shutdown_signal_receiver.changed()=> {
+                    return Ok(());
+                }
+
+                create_quic_client_result = Self::create_quic_client() => {
+                    match create_quic_client_result {
+                        Ok((endpoint, mut uni_streams)) => {
+                            loop {
+                                tokio::select! {
+                                    biased;
+
+                                    _ = shutdown_signal_receiver.changed()=> {
+                                        return Ok(());
+                                    }
+
+                                    next_uni_stream = uni_streams.next() => {
+                                        if let Some(Ok(recv)) = next_uni_stream {
+                                            // Because it is a unidirectional stream, we can only receive not send back.
+                                            let serialized_message = match recv.read_to_end(1_000_000).await {
+                                                Ok(serialized_message) => serialized_message,
+                                                Err(err) => {
+                                                    panic!("{err}")
+                                                }
+                                            };
+                                            Self::print_serialized_message(&serialized_message).await?;
+
+                                        } else {
+                                            eprintln!("lost connection to pchmd server");
+                                            endpoint.wait_idle().await;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("Failed to create quic client: {error}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn create_quic_client() -> Result<(Endpoint, IncomingUniStreams), String> {
@@ -869,17 +956,16 @@ impl<'a> CLIClient {
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
         endpoint.set_default_client_config(client_cfg);
 
-        let quinn::NewConnection {
-            connection,
-            uni_streams,
-            ..
-        } = endpoint
-            .connect(server_addr, "localhost") // TODO: configurable address
-            .unwrap()
-            .await
-            .unwrap(); // todo: deal with timeout?
-        println!("[client] connected: addr={}", connection.remote_address());
-        Ok((endpoint, uni_streams))
+        return match endpoint.connect(server_addr, "localhost").unwrap().await {
+            Ok(new_connection) => {
+                println!(
+                    "[client] connected: addr={}",
+                    new_connection.connection.remote_address()
+                );
+                Ok((endpoint, new_connection.uni_streams))
+            }
+            Err(error) => Err(error.to_string()),
+        };
     }
 
     async fn print_serialized_message(serialized_message: &Vec<u8>) -> crossterm::Result<()> {
@@ -891,7 +977,7 @@ impl<'a> CLIClient {
                 &mut serialized_message.as_slice(),
                 ::capnp::message::ReaderOptions::default(),
             )
-                .unwrap();
+            .unwrap();
             let computer_info = message_reader
                 .get_root::<pchmd_capnp::computer_info::Reader>()
                 .unwrap();
@@ -929,13 +1015,16 @@ impl<'a> CLIClient {
                     version.get_patch()
                 )))
                 .unwrap();
+            const NUM_STATIC_NEWLINES: usize = 4; // from above 4 prints(server version, os, etc)
 
+            // todo: need to keep track of num_newlines of LAST print and clear BEFORE the sleep to
+            // ensure no race condition with lost server connections (resulting in extra lines not being queued/cleared)
             let sensor_data_table =
                 Self::populate_sensor_data_table(computer_info.get_sensors().unwrap());
             let table_string = tabled::Table::new(sensor_data_table)
                 .with(tabled::Style::rounded())
                 .to_string();
-            num_newlines = (table_string.chars().filter(|&c| c == '\n').count() + 4) as u16;
+            num_newlines = (table_string.chars().filter(|&c| c == '\n').count() + NUM_STATIC_NEWLINES) as u16;
             stdout.queue(crossterm::style::Print(table_string)).unwrap();
             stdout.flush().unwrap();
         }
@@ -944,7 +1033,7 @@ impl<'a> CLIClient {
 
         // Required since: https://github.com/crossterm-rs/crossterm/issues/673
         stdout
-            .queue(crossterm::cursor::MoveToPreviousLine(num_newlines as u16))?
+            .queue(crossterm::cursor::MoveToPreviousLine(num_newlines))?
             .queue(crossterm::terminal::Clear(
                 crossterm::terminal::ClearType::FromCursorDown,
             ))?;
@@ -1057,7 +1146,7 @@ impl SSLCertificateGenerator {
     pub fn run() -> Result<(), String> {
         let config_directory_path = utils::get_config_directory_path();
         if let Some(error) =
-        utils::create_config_directory_if_needed(config_directory_path.as_path()).err()
+            utils::create_config_directory_if_needed(config_directory_path.as_path()).err()
         {
             return Err(format!(
                 "Failed to create config directory({}): {}",
@@ -1146,18 +1235,18 @@ mod utils {
                 })
                 .as_slice(),
         )
-            .unwrap_or_else(|_| {
-                panic!(
-                    "IO Error while reading certificate in {}",
-                    certificate_file_path.display()
-                )
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "failed to find PEM section while reading certificate in {}",
-                    certificate_file_path.display()
-                )
-            }) {
+        .unwrap_or_else(|_| {
+            panic!(
+                "IO Error while reading certificate in {}",
+                certificate_file_path.display()
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "failed to find PEM section while reading certificate in {}",
+                certificate_file_path.display()
+            )
+        }) {
             rustls_pemfile::Item::X509Certificate(certificate) => Ok(certificate),
             _ => {
                 return Err(format!(
