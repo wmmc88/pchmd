@@ -11,17 +11,18 @@ use std::io::{stdout, Write};
 use std::time::{Duration, Instant};
 use std::{error::Error, net::SocketAddr, sync::Arc};
 
-use capnp::serialize;
 use crossterm::{ExecutableCommand, QueueableCommand};
 use futures_util::StreamExt;
 use lm_sensors::prelude::*;
 use lm_sensors::value::Unit;
 use lm_sensors::Value;
-use quinn::{ConnectionError, Endpoint, IncomingUniStreams, NewConnection, WriteError};
+use quinn::{Endpoint, IncomingUniStreams, WriteError};
 use rand::prelude::*;
 use rand_pcg::Pcg64Mcg;
 use rand_seeder::Seeder;
 use tabled::Tabled;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::watch::error::RecvError;
 
 pub mod pchmd_capnp {
     #![allow(clippy::all)]
@@ -39,14 +40,7 @@ const DEFAULT_EWMA_ALPHA_VALUE: f64 = 0.3;
 const DEFAULT_UPDATE_PERIOD_SECONDS: f64 = 0.2;
 
 pub struct Server {
-    data_sources: Vec<DataSource>,
-    transport_interfaces: Vec<TransportInterface>,
-    sensor_data: SensorDataMap,
-
-    stale_time_seconds: f64,
-    ewma_alpha_value: f64,
-    // alpha value used for exponentially weighted moving average of each SensorValue
-    update_period_seconds: f64,
+    settings: Arc<parking_lot::Mutex<ServerSettings>>,
 }
 
 impl Server {
@@ -56,43 +50,125 @@ impl Server {
         transport_interfaces: Vec<TransportInterface>,
     ) -> Self {
         Self {
-            data_sources,
-            transport_interfaces,
-            sensor_data: SensorDataMap::new(),
-            stale_time_seconds: DEFAULT_STALE_TIME_SECONDS,
-            ewma_alpha_value: DEFAULT_EWMA_ALPHA_VALUE,
-            update_period_seconds: DEFAULT_UPDATE_PERIOD_SECONDS,
+            settings: Arc::new(parking_lot::Mutex::new(ServerSettings {
+                data_sources,
+                transport_interfaces,
+                stale_time_seconds: DEFAULT_STALE_TIME_SECONDS,
+                ewma_alpha_value: DEFAULT_EWMA_ALPHA_VALUE,
+                update_period_seconds: DEFAULT_UPDATE_PERIOD_SECONDS,
+            })),
         }
     }
 
-    pub fn run(&mut self) {
-        let update_period_duration = Duration::from_secs_f64(self.update_period_seconds);
-        let mut last_start_time = Instant::now();
-        loop {
-            let elapsed_duration = last_start_time.elapsed();
-            if elapsed_duration < update_period_duration {
-                std::thread::sleep(update_period_duration - last_start_time.elapsed());
-            } else if elapsed_duration > update_period_duration * 2 {
-                // TODO: add logging with time
-                eprintln!(
-                    "Update loop period exceeded by {:#?}",
-                    elapsed_duration - update_period_duration
-                );
+    pub async fn run(&mut self) {
+        let (shutdown_signal_sender, shutdown_signal_receiver) = tokio::sync::watch::channel(false);
+
+        let server_task_handle = tokio::spawn(ServerTask::run(
+            self.settings.clone(),
+            shutdown_signal_receiver,
+        ));
+
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                println!();
+                println!();
+                eprintln!("Shutting down pchmd server");
             }
-            last_start_time = Instant::now();
-            self.run_once();
+            Err(err) => {
+                eprintln!("Unable to listen for shutdown signal: {}", err);
+                // we also shut down in case of error
+            }
         }
+
+        shutdown_signal_sender
+            .send(true)
+            .expect("All pchmd server shutdown signal receivers have closed");
+
+        match server_task_handle.await {
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("Failed to join server_task handle: {error}");
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ServerSettings {
+    data_sources: Vec<DataSource>,
+    transport_interfaces: Vec<TransportInterface>,
+
+    stale_time_seconds: f64,
+    ewma_alpha_value: f64,
+    // alpha value used for exponentially weighted moving average of each SensorValue
+    update_period_seconds: f64,
+}
+
+#[derive(Debug)]
+struct ServerTask {
+    sensor_data: SensorDataMap,
+    settings: Arc<parking_lot::Mutex<ServerSettings>>,
+    shutdown_signal_receiver: tokio::sync::watch::Receiver<bool>,
+}
+
+impl ServerTask {
+    async fn run(
+        settings: Arc<parking_lot::Mutex<ServerSettings>>,
+        shutdown_signal_receiver: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let mut server_task = ServerTask {
+            sensor_data: SensorDataMap::new(),
+            settings,
+            shutdown_signal_receiver,
+        };
+
+        let update_period_duration =
+            Duration::from_secs_f64(server_task.settings.lock().update_period_seconds);
+        let mut last_start_time = Instant::now();
+
+        let mut shutdown_signal_receiver = server_task.shutdown_signal_receiver.clone();
+
+        let mut server_running = true;
+        while server_running {
+            tokio::select! {
+                biased;
+
+                _ = shutdown_signal_receiver.changed()=> {
+                    server_running = false;
+                }
+
+                _ = async {
+                        let elapsed_duration = last_start_time.elapsed();
+                        if elapsed_duration < update_period_duration {
+                            tokio::time::sleep(update_period_duration - last_start_time.elapsed()).await;
+                        } else if elapsed_duration > update_period_duration {
+                            // TODO: add logging with time
+                            eprintln!(
+                                "Update loop period exceeded by {:#?}",
+                                elapsed_duration - update_period_duration
+                            );
+                        }
+                        last_start_time = Instant::now();
+                        server_task.run_once();
+                    } => {}
+
+            }
+        }
+
+        eprintln!("PCHMD Server Task Terminated!");
     }
 
     fn run_once(&mut self) {
         // TODO: evaluate running each data source in parallel (queues to a thread that manages the data?)
-        for data_source in &self.data_sources {
-            data_source.update_values(&mut self.sensor_data, self.ewma_alpha_value);
+
+        let ewma_alpha_value = self.settings.lock().ewma_alpha_value;
+        for data_source in &mut self.settings.lock().data_sources {
+            data_source.update_values(&mut self.sensor_data, ewma_alpha_value);
         }
 
         let serialized_msg = self.serialize_to_capnproto();
 
-        for interface in &self.transport_interfaces {
+        for interface in &self.settings.lock().transport_interfaces {
             interface.send_message(serialized_msg.clone());
         }
     }
@@ -116,6 +192,7 @@ impl Server {
 
             computer_info.set_operating_system(std::env::consts::OS);
 
+            let stale_time_seconds = self.settings.lock().stale_time_seconds;
             let mut sensors = computer_info.init_sensors(self.sensor_data.len() as u32);
             for (index, (sensor_data_key, sensor_data_value)) in self.sensor_data.iter().enumerate()
             {
@@ -242,7 +319,7 @@ impl Server {
                 }
 
                 if sensor_data_value.last_update_instant.elapsed()
-                    > Duration::from_secs_f64(self.stale_time_seconds)
+                    > Duration::from_secs_f64(stale_time_seconds)
                 {
                     sensor_data.set_is_stale(true);
                 } else {
@@ -251,7 +328,7 @@ impl Server {
             }
         }
         let mut buffer = Vec::new();
-        serialize::write_message(&mut buffer, &message).unwrap();
+        capnp::serialize::write_message(&mut buffer, &message).unwrap();
         Arc::new(buffer)
     }
 }
@@ -274,7 +351,7 @@ impl DataSource {
         }
     }
 
-    fn update_values(&self, sensor_data_map: &mut SensorDataMap, ewma_alpha_value: f64) {
+    fn update_values(&mut self, sensor_data_map: &mut SensorDataMap, ewma_alpha_value: f64) {
         match self {
             DataSource::Libsensors(data_source) => {
                 data_source.update_values(sensor_data_map, ewma_alpha_value);
@@ -283,7 +360,7 @@ impl DataSource {
     }
 }
 
-type SensorDataMap = HashMap<SensorDataKey, SensorData>;
+type SensorDataMap = HashMap<SensorDataKey, SensorDataValue>;
 
 #[derive(Debug, Eq, Hash, PartialEq)]
 struct SensorDataKey {
@@ -292,7 +369,7 @@ struct SensorDataKey {
 }
 
 #[derive(Debug)]
-struct SensorData {
+struct SensorDataValue {
     current_value: SensorValue,
     average_value: SensorValue,
     minimum_value: SensorValue,
@@ -330,9 +407,12 @@ enum MeasurementUnit {
     Percentage,
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct LibsensorsDataSource {
-    lm_sensors_handle: Option<Box<lm_sensors::LMSensors>>,
+    libsensors_thread_handle: Option<std::thread::JoinHandle<()>>,
+    libsensors_thread_shutdown_sender: tokio::sync::watch::Sender<bool>,
+    libsensors_data_receiver:
+        tokio::sync::mpsc::Receiver<(SensorDataKey, SensorValue, Option<MeasurementUnit>, Instant)>,
     version: Option<String>,
 }
 
@@ -340,171 +420,245 @@ impl<'a> LibsensorsDataSource {
     const NAME: &'a str = "libsensors (lm-sensors library)";
 
     #[must_use]
-    pub fn new() -> Self {
-        let mut libsensors_data_source = Self::default();
-        libsensors_data_source.init();
-        libsensors_data_source
-    }
+    pub async fn new() -> Self {
+        let (libsensors_version_sender, libsensors_version_receiver) =
+            tokio::sync::oneshot::channel();
+        let (libsensors_thread_shutdown_sender, libsensors_thread_shutdown_receiver) =
+            tokio::sync::watch::channel(false);
+        let (libsensors_data_sender, libsensors_data_receiver) = tokio::sync::mpsc::channel(100); // TODO: configureable buffer size
 
-    fn init(&mut self) {
-        let lm_sensors_handle = lm_sensors::Initializer::default().initialize();
-        if let Err(error) = lm_sensors_handle {
-            panic!("Failed to initialize LibsensorsDataSource with error: {error}");
+        let libsensors_thread_handle = Some(std::thread::spawn(||
+            Self::libsensors_thread(
+                libsensors_version_sender,
+                libsensors_thread_shutdown_receiver,
+                libsensors_data_sender,
+            )
+        )); // TODO: name thread
+        let version = match libsensors_version_receiver.await {
+            Ok(version) => version,
+            Err(error) => {
+                eprintln!("Failed to receive {} version: {error}", Self::NAME);
+                None
+            }
+        };
+        Self {
+            libsensors_thread_handle,
+            libsensors_thread_shutdown_sender,
+            libsensors_data_receiver,
+            version,
         }
-
-        self.lm_sensors_handle = Some(Box::new(lm_sensors_handle.unwrap()));
-        self.version = self
-            .lm_sensors_handle
-            .as_ref()
-            .unwrap()
-            .version()
-            .map(str::to_string);
     }
 
     fn get_version(&self) -> Option<&str> {
         self.version.as_deref()
     }
 
-    fn update_values(&self, sensor_data_map: &mut SensorDataMap, ewma_alpha_value: f64) {
-        for chip in self.lm_sensors_handle.as_ref().unwrap().chip_iter(None) {
-            let sensor_location = chip.path().map_or_else(
-                || format!("{} at ({})", chip, chip.bus()),
-                |path| format!("{} at ({} [{}])", chip, chip.bus(), path.display()),
-            );
+    fn libsensors_thread(
+        libsensors_version_sender: tokio::sync::oneshot::Sender<Option<String>>,
+        libsensors_thread_shutdown_receiver: tokio::sync::watch::Receiver<bool>,
+        libsensors_data_sender: tokio::sync::mpsc::Sender<(
+            SensorDataKey,
+            SensorValue,
+            Option<MeasurementUnit>,
+            Instant,
+        )>,
+    ) {
+        let lm_sensors_handle = lm_sensors::Initializer::default().initialize();
+        if let Err(error) = lm_sensors_handle {
+            panic!("Failed to initialize LibsensorsDataSource with error: {error}");
+        }
+        libsensors_version_sender
+            .send(
+                lm_sensors_handle
+                    .as_ref()
+                    .unwrap()
+                    .version()
+                    .map(str::to_string),
+            )
+            .expect("Failed to send lm_sensors version to LibsensorsDataSource");
 
-            for feature in chip.feature_iter() {
-                let sensor_feature_name = if let Some(Ok(feature_name)) = feature.name() {
-                    format!("{}[{}]", feature, feature_name)
-                } else {
-                    format!("{}", feature)
-                };
+        let mut run_libsensors_thread = true;
+        while run_libsensors_thread {
+            for chip in lm_sensors_handle.as_ref().unwrap().chip_iter(None) {
+                let sensor_location = chip.path().map_or_else(
+                    || format!("{} at ({})", chip, chip.bus()),
+                    |path| format!("{} at ({} [{}])", chip, chip.bus(), path.display()),
+                );
 
-                for sub_feature in feature.sub_feature_iter() {
-                    let full_sensor_name =
-                        format!("{sub_feature} from {sensor_feature_name} on {sensor_location}");
-                    if let Ok(value) = sub_feature.value() {
-                        if let Ok(sensor_value) = Self::get_value(&value) {
-                            let sensor_data_map_key = SensorDataKey {
-                                sensor_name: full_sensor_name,
-                                data_source_name: Self::NAME.to_string(),
-                            };
+                for feature in chip.feature_iter() {
+                    let sensor_feature_name = if let Some(Ok(feature_name)) = feature.name() {
+                        format!("{}[{}]", feature, feature_name)
+                    } else {
+                        format!("{}", feature)
+                    };
 
-                            if let Some(sensor_data) = sensor_data_map.get_mut(&sensor_data_map_key)
-                            {
-                                sensor_data.current_value = sensor_value.clone();
+                    for sub_feature in feature.sub_feature_iter() {
+                        let full_sensor_name = format!(
+                            "{sub_feature} from {sensor_feature_name} on {sensor_location}"
+                        );
+                        if let Ok(value) = sub_feature.value() {
+                            if let Ok(sensor_value) = Self::get_value(&value) {
+                                let sensor_data_map_key = SensorDataKey {
+                                    sensor_name: full_sensor_name,
+                                    data_source_name: Self::NAME.to_string(),
+                                };
 
-                                {
-                                    let sensor_value = sensor_value.clone();
-                                    //sensor_data.average_value =
-                                    match &sensor_data.average_value {
-                                        SensorValue::Float(average_value) => {
-                                            if let SensorValue::Float(current_value) = sensor_value
-                                            {
-                                                let average_value = ewma_alpha_value
-                                                    * current_value
-                                                    + (1.0 - ewma_alpha_value) * average_value;
-                                                sensor_data.average_value =
-                                                    SensorValue::Float(average_value);
-                                            }
+                                if let Err(error) = libsensors_data_sender
+                                    .try_send((
+                                        sensor_data_map_key,
+                                        sensor_value.clone(),
+                                        Self::get_measurement_unit(&value),
+                                        Instant::now(),
+                                    )) {
+                                    match error{
+                                        TrySendError::Full(_) => {
+                                            eprintln!("libsensors_data channel buffer is full! sensor reading dropped!");
                                         }
-                                        SensorValue::RawBool(average_value) => {
-                                            if let SensorValue::RawBool(current_value) =
-                                                sensor_value
-                                            {
-                                                let average_value = ewma_alpha_value
-                                                    * current_value
-                                                    + (1.0 - ewma_alpha_value) * average_value;
-                                                sensor_data.average_value =
-                                                    SensorValue::Float(average_value);
-                                            }
-                                        }
-                                        SensorValue::Text(_average_value) => {
-                                            // TODO: should have a count and set average value to highest count
-                                        }
-                                        SensorValue::Bool(_) => {
-                                            unreachable!();
+                                        TrySendError::Closed(_) => {
+                                            // Server is shutting down
+                                            continue;
                                         }
                                     }
+                                };
+                            }
+                        } else {
+                            eprintln!("Failed to get value for {full_sensor_name}!");
+                        }
+                    }
+                }
+            }
+
+            match libsensors_thread_shutdown_receiver.has_changed() {
+                Err(_) => {
+                    eprintln!("libsensors_thread_shutdown channel has closed prematurely");
+                    run_libsensors_thread = false;
+                }
+
+                Ok(shutdown_triggered) => {
+                    if shutdown_triggered {
+                        run_libsensors_thread = false;
+                    } else {
+                        std::thread::sleep(Duration::from_millis(500)); // use update period
+                    }
+                }
+            }
+
+        }
+        eprintln!("Libsensors Thread Terminated!");
+    }
+
+    fn update_values(&mut self, sensor_data_map: &mut SensorDataMap, ewma_alpha_value: f64) {
+        match self.libsensors_data_receiver.try_recv() {
+            Err(recv_error) => {
+                match recv_error {
+                    tokio::sync::mpsc::error::TryRecvError::Empty => {
+                        // waiting for new data from libsensors_thread
+                    }
+                    tokio::sync::mpsc::error::TryRecvError::Disconnected => {
+                        panic!("libsensors_data channel is closed!");
+                    }
+                }
+            }
+            Ok((sensor_data_map_key, sensor_value, measurement_unit, last_update_instant)) => {
+                if let Some(sensor_data) = sensor_data_map.get_mut(&sensor_data_map_key) {
+                    // Update existing values
+                    sensor_data.current_value = sensor_value.clone();
+                    {
+                        let sensor_value = sensor_value.clone();
+                        //sensor_data.average_value =
+                        match &sensor_data.average_value {
+                            SensorValue::Float(average_value) => {
+                                if let SensorValue::Float(current_value) = sensor_value {
+                                    let average_value = ewma_alpha_value * current_value
+                                        + (1.0 - ewma_alpha_value) * average_value;
+                                    sensor_data.average_value = SensorValue::Float(average_value);
                                 }
-                                {
-                                    let sensor_value = sensor_value.clone();
-                                    match &sensor_data.minimum_value {
-                                        SensorValue::Float(minimum_value) => {
-                                            if let SensorValue::Float(current_value) = sensor_value
-                                            {
-                                                if current_value < *minimum_value {
-                                                    sensor_data.minimum_value = sensor_value;
-                                                }
-                                            }
-                                        }
-                                        SensorValue::RawBool(minimum_value) => {
-                                            if let SensorValue::RawBool(current_value) =
-                                                sensor_value
-                                            {
-                                                if current_value < *minimum_value {
-                                                    sensor_data.minimum_value = sensor_value;
-                                                }
-                                            }
-                                        }
-                                        SensorValue::Text(minimum_value) => {
-                                            if let SensorValue::Text(ref current_value) =
-                                                sensor_value
-                                            {
-                                                if *current_value < *minimum_value {
-                                                    sensor_data.minimum_value = sensor_value;
-                                                }
-                                            }
-                                        }
-                                        SensorValue::Bool(_) => {
-                                            unreachable!();
-                                        }
-                                    }
+                            }
+                            SensorValue::RawBool(average_value) => {
+                                if let SensorValue::RawBool(current_value) = sensor_value {
+                                    let average_value = ewma_alpha_value * current_value
+                                        + (1.0 - ewma_alpha_value) * average_value;
+                                    sensor_data.average_value = SensorValue::Float(average_value);
                                 }
-                                match &sensor_data.maximum_value {
-                                    SensorValue::Float(maximum_value) => {
-                                        if let SensorValue::Float(current_value) = sensor_value {
-                                            if current_value > *maximum_value {
-                                                sensor_data.maximum_value = sensor_value;
-                                            }
-                                        }
-                                    }
-                                    SensorValue::RawBool(maximum_value) => {
-                                        if let SensorValue::RawBool(current_value) = sensor_value {
-                                            if current_value > *maximum_value {
-                                                sensor_data.maximum_value = sensor_value;
-                                            }
-                                        }
-                                    }
-                                    SensorValue::Text(maximum_value) => {
-                                        if let SensorValue::Text(ref current_value) = sensor_value {
-                                            if *current_value > *maximum_value {
-                                                sensor_data.maximum_value = sensor_value;
-                                            }
-                                        }
-                                    }
-                                    SensorValue::Bool(_) => {
-                                        unreachable!();
-                                    }
-                                }
-
-                                sensor_data.last_update_instant = Instant::now();
-                            } else {
-                                sensor_data_map.insert(
-                                    sensor_data_map_key,
-                                    SensorData {
-                                        current_value: sensor_value.clone(),
-                                        average_value: sensor_value.clone(),
-                                        minimum_value: sensor_value.clone(),
-                                        maximum_value: sensor_value,
-                                        measurement_unit: Self::get_measurement_unit(&value),
-                                        last_update_instant: Instant::now(),
-                                    },
-                                );
+                            }
+                            SensorValue::Text(_average_value) => {
+                                // TODO: should have a count and set average value to highest count
+                            }
+                            SensorValue::Bool(_) => {
+                                unreachable!();
                             }
                         }
-                    } else {
-                        eprintln!("Failed to get value for {full_sensor_name}!");
                     }
+                    {
+                        let sensor_value = sensor_value.clone();
+                        match &sensor_data.minimum_value {
+                            SensorValue::Float(minimum_value) => {
+                                if let SensorValue::Float(current_value) = sensor_value {
+                                    if current_value < *minimum_value {
+                                        sensor_data.minimum_value = sensor_value;
+                                    }
+                                }
+                            }
+                            SensorValue::RawBool(minimum_value) => {
+                                if let SensorValue::RawBool(current_value) = sensor_value {
+                                    if current_value < *minimum_value {
+                                        sensor_data.minimum_value = sensor_value;
+                                    }
+                                }
+                            }
+                            SensorValue::Text(minimum_value) => {
+                                if let SensorValue::Text(ref current_value) = sensor_value {
+                                    if *current_value < *minimum_value {
+                                        sensor_data.minimum_value = sensor_value;
+                                    }
+                                }
+                            }
+                            SensorValue::Bool(_) => {
+                                unreachable!();
+                            }
+                        }
+                    }
+                    match &sensor_data.maximum_value {
+                        SensorValue::Float(maximum_value) => {
+                            if let SensorValue::Float(current_value) = sensor_value {
+                                if current_value > *maximum_value {
+                                    sensor_data.maximum_value = sensor_value;
+                                }
+                            }
+                        }
+                        SensorValue::RawBool(maximum_value) => {
+                            if let SensorValue::RawBool(current_value) = sensor_value {
+                                if current_value > *maximum_value {
+                                    sensor_data.maximum_value = sensor_value;
+                                }
+                            }
+                        }
+                        SensorValue::Text(maximum_value) => {
+                            if let SensorValue::Text(ref current_value) = sensor_value {
+                                if *current_value > *maximum_value {
+                                    sensor_data.maximum_value = sensor_value;
+                                }
+                            }
+                        }
+                        SensorValue::Bool(_) => {
+                            unreachable!();
+                        }
+                    }
+
+                    sensor_data.last_update_instant = last_update_instant;
+                } else {
+                    // Insert New Value
+                    sensor_data_map.insert(
+                        sensor_data_map_key,
+                        SensorDataValue {
+                            current_value: sensor_value.clone(),
+                            average_value: sensor_value.clone(),
+                            minimum_value: sensor_value.clone(),
+                            maximum_value: sensor_value,
+                            measurement_unit,
+                            last_update_instant,
+                        },
+                    );
                 }
             }
         }
@@ -635,6 +789,24 @@ impl<'a> LibsensorsDataSource {
     }
 }
 
+impl Drop for LibsensorsDataSource {
+    fn drop(&mut self) {
+        // TODO: all drops in this file should not wait on join. should just check that some other "join" or "stop" method has been called, else panic!
+
+        if let Err(error) = self.libsensors_thread_shutdown_sender.send(true) {
+            eprintln!("Failed to send shutdown signal to libsensors_thread: {error}");
+        }
+
+        if let Some(libsensors_thread_handle) = self.libsensors_thread_handle.take() {
+            libsensors_thread_handle
+                .join()
+                .expect("Failed to join libsensors_thread_handle");
+        } else {
+            panic!("libsensors_thread_handle is None!");
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum TransportInterface {
     QUIC(QUICTransportInterface),
@@ -653,9 +825,6 @@ impl TransportInterface {
 #[derive(Debug)]
 pub struct QUICTransportInterface {
     serialized_sensor_data_sender: tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
-
-    // must keep runtime in scope to keep quic_server_task_handle and other spawned tasks alive
-    _tokio_runtime: tokio::runtime::Runtime,
 }
 
 impl<'a> QUICTransportInterface {
@@ -680,7 +849,6 @@ impl<'a> QUICTransportInterface {
                 ctrl_c_sig_result = tokio::signal::ctrl_c() => {
                     match ctrl_c_sig_result {
                         Ok(()) => {
-                            println!();
                             eprintln!("Shutting down quic_transport_interface");
                         },
                         Err(err) => {
@@ -711,6 +879,8 @@ impl<'a> QUICTransportInterface {
                 }
             }
         }
+
+        eprintln!("QUIC Server Task Terminated!");
     }
 
     async fn client_connection_task(
@@ -771,6 +941,8 @@ impl<'a> QUICTransportInterface {
                 eprintln!("Failed to join client_connection_monitor_task handle: {error}");
             }
         }
+
+        eprintln!("Client Connection Task Terminated!");
     }
 
     async fn client_connection_monitor_task(
@@ -784,7 +956,7 @@ impl<'a> QUICTransportInterface {
                 None => {
                     // connection terminated and/or client_stream_handles_sender dropped
                     drop(connection_lost_sender);
-                    return;
+                    break;
                 }
                 Some(client_stream_task_join_handle) => {
                     match client_stream_task_join_handle.await {
@@ -793,7 +965,7 @@ impl<'a> QUICTransportInterface {
                                 if connection_lost_sender.send(()).is_err() {
                                     eprintln!("Failed to send connection lost signal to client_connection_monitor_task");
                                 }
-                                return;
+                                break;
                             }
                         }
                         Err(error) => {
@@ -803,6 +975,8 @@ impl<'a> QUICTransportInterface {
                 }
             }
         }
+
+        eprintln!("Client Connection Monitor Task Terminated!");
     }
 
     async fn client_stream_task(
@@ -843,17 +1017,11 @@ impl Default for QUICTransportInterface {
         let (serialized_sensor_data_sender, _serialized_sensor_data_receiver) =
             tokio::sync::broadcast::channel((2.0 / DEFAULT_UPDATE_PERIOD_SECONDS).ceil() as usize); // todo: configurable capacity?
 
-        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        tokio_runtime.spawn(Self::quic_server_task(
+        tokio::spawn(Self::quic_server_task(
             serialized_sensor_data_sender.clone(),
-        ));
-
+        )); // todo handle task handle
         Self {
             serialized_sensor_data_sender,
-            _tokio_runtime: tokio_runtime,
         }
     }
 }
@@ -922,6 +1090,8 @@ impl<'a> CLIClient {
                                                     panic!("{err}")
                                                 }
                                             };
+
+                                            // TODO: prevent backup of stale values by printing latest value always. maybe queue up all serialized messages here in a fixed size buffer, and then have a seeprate printing thread that has a max print speed
                                             Self::print_serialized_message(&serialized_message).await?;
 
                                         } else {
@@ -1017,19 +1187,18 @@ impl<'a> CLIClient {
                 .unwrap();
             const NUM_STATIC_NEWLINES: usize = 4; // from above 4 prints(server version, os, etc)
 
-            // todo: need to keep track of num_newlines of LAST print and clear BEFORE the sleep to
-            // ensure no race condition with lost server connections (resulting in extra lines not being queued/cleared)
             let sensor_data_table =
                 Self::populate_sensor_data_table(computer_info.get_sensors().unwrap());
             let table_string = tabled::Table::new(sensor_data_table)
                 .with(tabled::Style::rounded())
                 .to_string();
-            num_newlines = (table_string.chars().filter(|&c| c == '\n').count() + NUM_STATIC_NEWLINES) as u16;
+            num_newlines =
+                (table_string.chars().filter(|&c| c == '\n').count() + NUM_STATIC_NEWLINES) as u16;
             stdout.queue(crossterm::style::Print(table_string)).unwrap();
             stdout.flush().unwrap();
         }
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Required since: https://github.com/crossterm-rs/crossterm/issues/673
         stdout
@@ -1093,6 +1262,7 @@ impl<'a> CLIClient {
                         SensorValue::Text(value.unwrap().to_string())
                     }
                 },
+                // TODO: handle units
                 // measurement_unit: match sensor.get_measurement_unit().unwrap() {
                 //
                 // },
