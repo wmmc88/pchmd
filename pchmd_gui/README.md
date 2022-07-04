@@ -1,4 +1,4 @@
-# pchmd_client
+# pchmd_gui
 
 GUI Client for PCHMD
 

@@ -1,6 +1,6 @@
 {
-    "name": "pchmd_client",
-    "short_name": "pchmd_client",
+    "name": "pchmd_gui",
+    "short_name": "pchmd_gui",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",

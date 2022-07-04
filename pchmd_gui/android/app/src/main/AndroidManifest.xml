@@ -1,7 +1,6 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="org.pchmd.pchmd_client">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
    <application
-        android:label="pchmd_client"
+        android:label="pchmd_gui"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
